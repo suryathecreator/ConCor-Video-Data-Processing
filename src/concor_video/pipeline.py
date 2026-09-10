@@ -352,30 +352,41 @@ def _sam_tracklets_for_prompt(
     )
     masks_by_object: dict[int, dict[int, np.ndarray]] = {}
     scores_by_object: dict[int, list[float]] = {}
-    for response in predictor.handle_stream_request(
-        {
-            "type": "propagate_in_video",
-            "session_id": session_id,
-            "propagation_direction": "forward",
-            "start_frame_index": 0,
-            "max_frame_num_to_track": frame_count,
-            "output_prob_thresh": output_threshold,
-        }
-    ):
-        frame_index = int(response["frame_index"])
-        if not 0 <= frame_index < frame_count:
-            continue
-        outputs = response["outputs"]
-        object_ids = np.asarray(outputs.get("out_obj_ids", []), dtype=np.int64).reshape(-1)
-        masks = np.asarray(outputs.get("out_binary_masks", []))
-        scores = np.asarray(outputs.get("out_probs", np.ones(len(object_ids))), dtype=float).reshape(-1)
-        for local_index, object_id_raw in enumerate(object_ids):
-            object_id = int(object_id_raw)
-            masks_by_object.setdefault(object_id, {})[frame_index] = _normalize_mask(
-                masks[local_index]
-            )
-            score = float(scores[local_index]) if local_index < len(scores) else 1.0
-            scores_by_object.setdefault(object_id, []).append(score)
+    try:
+        responses = predictor.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": 0,
+                "max_frame_num_to_track": frame_count,
+                "output_prob_thresh": output_threshold,
+            }
+        )
+        for response in responses:
+            frame_index = int(response["frame_index"])
+            if not 0 <= frame_index < frame_count:
+                continue
+            outputs = response["outputs"]
+            object_ids = np.asarray(outputs.get("out_obj_ids", []), dtype=np.int64).reshape(-1)
+            masks = np.asarray(outputs.get("out_binary_masks", []))
+            scores = np.asarray(
+                outputs.get("out_probs", np.ones(len(object_ids))), dtype=float
+            ).reshape(-1)
+            for local_index, object_id_raw in enumerate(object_ids):
+                object_id = int(object_id_raw)
+                masks_by_object.setdefault(object_id, {})[frame_index] = _normalize_mask(
+                    masks[local_index]
+                )
+                score = float(scores[local_index]) if local_index < len(scores) else 1.0
+                scores_by_object.setdefault(object_id, []).append(score)
+    except RuntimeError as error:
+        # SAM3.1 raises this when the text detector returns zero proposals. That
+        # is a valid model outcome, not an infrastructure failure: downstream
+        # disposition records it as a missing referent or unresolved context.
+        if str(error) == "No points are provided; please add points first":
+            return []
+        raise
     rows: list[dict[str, Any]] = []
     for object_id, frame_map in sorted(masks_by_object.items()):
         arrays = [frame_map.get(index) for index in range(frame_count)]

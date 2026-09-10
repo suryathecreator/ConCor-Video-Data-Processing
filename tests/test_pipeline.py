@@ -109,6 +109,21 @@ def test_ground_truth_target_and_sam_context(tmp_path) -> None:
     assert ball_link["tracklet_ids"] == ["sam-context-001"]
 
 
+class NoProposalPredictor(FakePredictor):
+    def handle_stream_request(self, request):
+        raise RuntimeError("No points are provided; please add points first")
+
+
+def test_no_sam_proposal_is_a_disposition_not_an_error(tmp_path) -> None:
+    record = process_unit(
+        _unit(tmp_path / "inputs", ground_truth=False),
+        provider=DatasetProvider(tmp_path / "cache"),
+        predictor=NoProposalPredictor(),
+    )
+    assert record["disposition"] == "missing_main_referent"
+    assert record["tracklets"] == []
+
+
 def test_missing_public_target_is_labeled_sam_prediction(tmp_path) -> None:
     record = process_unit(
         _unit(tmp_path / "inputs", ground_truth=False),
