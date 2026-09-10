@@ -4,7 +4,7 @@ DATA_ROOT="${1:?usage: prepare_public_datasets.sh DATA_ROOT}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 REF_ROOT="${DATA_ROOT}/ref-youtube-vos"; REVOS_ROOT="${DATA_ROOT}/ReVOS"; DOWNLOADS="${DATA_ROOT}/.downloads"
 mkdir -p "${REF_ROOT}/archives" "${REVOS_ROOT}" "${DOWNLOADS}"
-download() { local url="$1" output="$2"; if [[ ! -s "${output}" ]]; then mkdir -p "$(dirname "${output}")"; curl --fail --location --retry 8 --retry-all-errors --continue-at - --output "${output}.part" "${url}"; mv "${output}.part" "${output}"; fi; }
+download() { local url="$1" output="$2"; if [[ ! -s "${output}" ]]; then mkdir -p "$(dirname "${output}")"; curl --fail --location --retry 8 --retry-delay 5 --continue-at - --output "${output}.part" "${url}"; mv "${output}.part" "${output}"; fi; }
 base="https://huggingface.co/datasets/blue7012/ref-youtube-vos/resolve/main"
 download "${base}/valid_data/meta_expressions.zip" "${DOWNLOADS}/ref-meta-expressions.zip"
 download "${base}/train_data/train.zip" "${REF_ROOT}/archives/train.zip"
