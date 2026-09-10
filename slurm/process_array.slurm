@@ -8,16 +8,30 @@
 set -euo pipefail
 : "${REPO_ROOT:?}" "${PYTHON_BIN:?}" "${CAMPAIGN_ROOT:?}" "${SAM31_REPO_ROOT:?}" "${SAM31_CHECKPOINT:?}" "${SHARD_COUNT:?}"
 task_id="${SLURM_ARRAY_TASK_ID:-0}"; array_job_id="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"; restart_count="${SLURM_RESTART_COUNT:-0}"; scratch_base="${SLURM_TMPDIR:-/tmp}"
-JOB_CACHE_ROOT="${scratch_base}/concor-video-${array_job_id}-${task_id}-r${restart_count}"
 NODE_ASSET_ROOT="/tmp/${USER}-concor-video-assets"
-mkdir -p "${JOB_CACHE_ROOT}/"{torch,triton,cuda,xdg,pycache} "${NODE_ASSET_ROOT}"
+mkdir -p "${NODE_ASSET_ROOT}"
+# Remove only abandoned atomic parts from this user-owned cache. Locks ensure a
+# concurrent task on the same node cannot be writing a matching part.
+( flock 9; find "${NODE_ASSET_ROOT}" -maxdepth 1 -type d -name 'runtime-*.part-*' -exec rm -rf -- {} + ) 9>"${NODE_ASSET_ROOT}/runtime.lock"
+( flock 9; find "${NODE_ASSET_ROOT}" -maxdepth 1 -type f -name 'sam31-*.pt.part-*' -delete ) 9>"${NODE_ASSET_ROOT}/checkpoint.lock"
+scratch_available_kb="$(df -Pk "${scratch_base}" | awk 'NR==2 {print $4}')"
+local_stage_ok=1
+if (( scratch_available_kb < 5 * 1024 * 1024 )); then local_stage_ok=0; fi
+if (( local_stage_ok )); then
+  JOB_CACHE_ROOT="${scratch_base}/concor-video-${array_job_id}-${task_id}-r${restart_count}"
+else
+  JOB_CACHE_ROOT="${CAMPAIGN_ROOT}/fallback-job-cache/${array_job_id}-${task_id}-r${restart_count}"
+  echo "[staging] low node-local space (${scratch_available_kb} KiB); using shared mutable scratch" >&2
+fi
+mkdir -p "${JOB_CACHE_ROOT}/"{torch,triton,cuda,xdg,pycache}
+cleanup_job_cache() { rm -rf -- "${JOB_CACHE_ROOT}"; }
+trap cleanup_job_cache EXIT
 runtime_root=""
-if [[ -n "${PYTHON_RUNTIME_ARCHIVE:-}" ]]; then
+if [[ -n "${PYTHON_RUNTIME_ARCHIVE:-}" ]] && (( local_stage_ok )); then
   runtime_key="$(stat -c '%s-%Y' "${PYTHON_RUNTIME_ARCHIVE}")"
   runtime_candidate="${NODE_ASSET_ROOT}/runtime-${runtime_key}"
   if (
     flock 9
-    find "${NODE_ASSET_ROOT}" -maxdepth 1 -type d -name 'runtime-*.part-*' -exec rm -rf -- {} +
     if [[ ! -s "${runtime_candidate}/.complete" ]]; then
       temp="${runtime_candidate}.part-${SLURM_JOB_ID}-${task_id}"
       mkdir -p "${temp}"
@@ -38,9 +52,8 @@ fi
 checkpoint_key="$(stat -c '%s-%Y' "${SAM31_CHECKPOINT}")"
 checkpoint_candidate="${NODE_ASSET_ROOT}/sam31-${checkpoint_key}.pt"
 LOCAL_CHECKPOINT="${SAM31_CHECKPOINT}"
-if (
+if (( local_stage_ok )) && (
   flock 9
-  find "${NODE_ASSET_ROOT}" -maxdepth 1 -type f -name 'sam31-*.pt.part-*' -delete
   if [[ ! -s "${checkpoint_candidate}" ]]; then
     part="${checkpoint_candidate}.part-${SLURM_JOB_ID}-${task_id}"
     if ! cp --reflink=auto "${SAM31_CHECKPOINT}" "${part}"; then
