@@ -21,12 +21,15 @@ checkpoint_key="$(stat -c '%s-%Y' "${SAM31_CHECKPOINT}")"; LOCAL_CHECKPOINT="${N
 export XDG_CACHE_HOME="${JOB_CACHE_ROOT}/xdg" TORCHINDUCTOR_CACHE_DIR="${JOB_CACHE_ROOT}/torch" TRITON_CACHE_DIR="${JOB_CACHE_ROOT}/triton" CUDA_CACHE_PATH="${JOB_CACHE_ROOT}/cuda" PYTHONPYCACHEPREFIX="${JOB_CACHE_ROOT}/pycache"
 export PYTHONPATH="${REPO_ROOT}/src:${SAM31_REPO_ROOT}${runtime_root:+:${runtime_root}/site-packages}${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HOME="${HF_HOME:-${CAMPAIGN_ROOT}/shared-cache/huggingface}"
-mkdir -p "${HF_HOME}" "${FRAME_CACHE_ROOT:-${CAMPAIGN_ROOT}/cache}"
+# Decoded frames are reproducible scratch, not checkpoints. Keep them node-local
+# to avoid shared-filesystem metadata traffic and output-file explosion.
+FRAME_CACHE_PATH="${FRAME_CACHE_ROOT:-${JOB_CACHE_ROOT}/frames}"
+mkdir -p "${HF_HOME}" "${FRAME_CACHE_PATH}"
 flags=(--no-compile --no-warm-up --no-fa3)
 [[ "${COMPILE_MODEL:-0}" == "1" ]] && flags=(--compile --warm-up --no-fa3)
 [[ "${USE_FA3:-0}" == "1" ]] && flags+=(--fa3)
 set +e
-"${PYTHON_BIN}" -m concor_video.cli process --worklist "${CAMPAIGN_ROOT}/worklist.json" --campaign-root "${CAMPAIGN_ROOT}" --frame-cache-root "${FRAME_CACHE_ROOT:-${CAMPAIGN_ROOT}/cache}" --checkpoint "${LOCAL_CHECKPOINT}" --shard-index "${task_id}" --shard-count "${SHARD_COUNT}" --max-error-attempts "${MAX_ERROR_ATTEMPTS:-3}" "${flags[@]}"
+"${PYTHON_BIN}" -m concor_video.cli process --worklist "${CAMPAIGN_ROOT}/worklist.json" --campaign-root "${CAMPAIGN_ROOT}" --frame-cache-root "${FRAME_CACHE_PATH}" --checkpoint "${LOCAL_CHECKPOINT}" --shard-index "${task_id}" --shard-count "${SHARD_COUNT}" --max-error-attempts "${MAX_ERROR_ATTEMPTS:-3}" "${flags[@]}"
 worker_rc=$?; set -e
 if [[ "${worker_rc}" -eq 99 ]]; then scontrol requeue "${SLURM_JOB_ID}"; exit 0; fi
 exit "${worker_rc}"

@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image
 
 from .rle import decode_rle, encode_rle
+from .tar_index import IndexedTarReader
 from .tracklet_schema import SCHEMA_VERSION, make_span, rebuild_span_links, validate_record
 
 
@@ -142,6 +143,7 @@ class DatasetProvider:
         self.cache_root = cache_root.resolve()
         self._archives: dict[Path, zipfile.ZipFile] = {}
         self._archive_names: dict[Path, set[str]] = {}
+        self._tar_archives: dict[Path, IndexedTarReader] = {}
         self._mask_dicts: dict[Path, dict[str, list[dict[str, Any] | None]]] = {}
         self._mask_databases: dict[Path, sqlite3.Connection] = {}
         self._mask_sequences: dict[tuple[Path, str], list[dict[str, Any] | None]] = {}
@@ -155,6 +157,12 @@ class DatasetProvider:
         return self._archives[path]
 
     def _member(self, source: Path, candidates: tuple[str, ...]) -> bytes:
+        if source.suffix.lower() == ".tar":
+            reader = self._tar_archives.get(source)
+            if reader is None:
+                reader = IndexedTarReader(source)
+                self._tar_archives[source] = reader
+            return reader.read(candidates)[1]
         archive = self._archive(source)
         names = self._archive_names[source]
         name = next((value for value in candidates if value in names), None)
@@ -174,6 +182,7 @@ class DatasetProvider:
                 "valid/JPEGImages/",
                 "val/JPEGImages/",
                 "test/JPEGImages/",
+                "ReVOS/JPEGImages/",
             )
             for suffix in (".jpg", ".jpeg", ".png")
         )
@@ -307,9 +316,12 @@ class DatasetProvider:
     def close(self) -> None:
         for archive in self._archives.values():
             archive.close()
+        for archive in self._tar_archives.values():
+            archive.close()
         for connection in self._mask_databases.values():
             connection.close()
         self._archives.clear()
+        self._tar_archives.clear()
         self._mask_databases.clear()
 
 def _normalize_mask(value: Any) -> np.ndarray:

@@ -67,6 +67,17 @@ def _build_parser() -> argparse.ArgumentParser:
     mask_index.add_argument("--source", type=Path, required=True)
     mask_index.add_argument("--output", type=Path, required=True)
 
+    tar_index = commands.add_parser(
+        "index-revos-tar", help="index an uncompressed ReVOS tar for direct frame reads"
+    )
+    tar_index.add_argument("--source", type=Path, required=True)
+    tar_index.add_argument("--output", type=Path)
+    tar_index.add_argument(
+        "--extract-root",
+        type=Path,
+        help="also extract only the three metadata files required by the pipeline",
+    )
+
     process = commands.add_parser("process", help="run one checkpointable worker")
     process.add_argument("--worklist", type=Path, required=True)
     process.add_argument("--campaign-root", type=Path, required=True)
@@ -155,6 +166,29 @@ def main() -> None:
 
         count = index_revos_masks(args.source.resolve(), args.output.resolve())
         print(json.dumps({"mask_sequences": count, "output": str(args.output.resolve())}))
+        return
+    if args.command == "index-revos-tar":
+        from .tar_index import IndexedTarReader, index_tar
+
+        source = args.source.resolve()
+        output = (
+            args.output.resolve()
+            if args.output
+            else source.with_suffix(source.suffix + ".sqlite")
+        )
+        count = index_tar(source, output)
+        extracted: list[str] = []
+        if args.extract_root:
+            root = args.extract_root.resolve()
+            with IndexedTarReader(source, output) as archive:
+                for name in (
+                    "ReVOS/meta_expressions_train_.json",
+                    "ReVOS/meta_expressions_valid_.json",
+                    "ReVOS/mask_dict.json",
+                ):
+                    archive.extract(name, root / name)
+                    extracted.append(str(root / name))
+        print(json.dumps({"members": count, "output": str(output), "extracted": extracted}))
         return
     if args.command == "process":
         if not 0 <= args.shard_index < args.shard_count:

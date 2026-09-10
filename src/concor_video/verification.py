@@ -19,6 +19,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .tar_index import IndexedTarReader
 from .tracklet_schema import rebuild_span_links
 
 
@@ -216,6 +217,7 @@ class VerificationState:
         if not self.rows:
             raise ValueError("verification input contains no instructions")
         self._archives: dict[Path, zipfile.ZipFile] = {}
+        self._tar_archives: dict[Path, IndexedTarReader] = {}
         self._archive_names: dict[Path, set[str]] = {}
         self._archive_lock = threading.Lock()
 
@@ -257,7 +259,7 @@ class VerificationState:
             f"{prefix}{video_id}/{frame_id}{suffix}"
             for prefix in (
                 "", "JPEGImages/", "train/JPEGImages/", "valid/JPEGImages/",
-                "val/JPEGImages/", "test/JPEGImages/",
+                "val/JPEGImages/", "test/JPEGImages/", "ReVOS/JPEGImages/",
             )
             for suffix in (".jpg", ".jpeg", ".png")
         )
@@ -285,6 +287,17 @@ class VerificationState:
                     member = next((name for name in candidates if name in names), None)
                     if member:
                         return archive.read(member), mimetypes.guess_type(member)[0] or "image/jpeg"
+            elif source.is_file() and source.suffix.lower() == ".tar":
+                with self._archive_lock:
+                    archive = self._tar_archives.get(source)
+                    if archive is None:
+                        archive = IndexedTarReader(source)
+                        self._tar_archives[source] = archive
+                    try:
+                        member, payload = archive.read(candidates)
+                    except FileNotFoundError:
+                        continue
+                    return payload, mimetypes.guess_type(member)[0] or "image/jpeg"
         raise FileNotFoundError(f"frame {frame_id} for {sample_id} was not found")
 
 

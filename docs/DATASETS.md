@@ -27,11 +27,12 @@ Nonexistent descriptions are intentional negative records and are never sent to 
 
 ~~~text
 ReVOS/
-  JPEGImages/<video>/<frame>.jpg
+  ReVOS.tar
+  ReVOS.tar.sqlite
   meta_expressions_train_.json
   meta_expressions_valid_.json
   mask_dict.json
   mask_dict.sqlite
 ~~~
 
-The generated SQLite file maps annotation IDs to sequences and prevents 32 workers from each parsing the large JSON mask dictionary. Dataset media and annotations are not redistributed here.
+`ReVOS.tar.sqlite` maps archive names to byte offsets, so workers read frames directly from the uncompressed tar without creating a large small-file tree on shared storage. `mask_dict.sqlite` maps annotation IDs to sequences and prevents 32 workers from each parsing the large JSON mask dictionary. Dataset media and annotations are not redistributed here.

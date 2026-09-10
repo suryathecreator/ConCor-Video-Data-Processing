@@ -18,7 +18,7 @@ Tracks are removed when too short, under 64 pixels over the sequence, or below c
 
 Thirty-two array tasks inspect the same sorted video queue from different rotations. Exclusive video leases prevent simultaneous sessions for one video. Nested sample leases and atomic rename commits prevent duplicate/corrupt records. Leases heartbeat and become recoverable after a dead worker. Persistent errors stop after a bounded number of attempts.
 
-SIGUSR1 requests a drain: finish the active instruction, fsync its JSON, close the session, then requeue. Records, errors, worklists, and the shared frame cache live outside node-local storage. Mutable Torch/Triton/CUDA caches are job/task/restart-specific. Immutable checkpoint/runtime staging is node-shared under flock.
+SIGUSR1 requests a drain: finish the active instruction, fsync its JSON, close the session, then requeue. Records, errors, and worklists live outside node-local storage. Reproducible decoded-frame scratch and mutable Torch/Triton/CUDA caches are job/task/restart-specific and node-local. Immutable checkpoint/runtime staging is node-shared under flock.
 
 Eager SAM execution is the default because measured max-autotune warmup took roughly 23 minutes for this workload. Optional compiled mode remains available for a separately benchmarked long-lived campaign.
 

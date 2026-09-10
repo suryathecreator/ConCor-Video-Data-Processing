@@ -268,9 +268,17 @@ def build_revos_units(
         ],
         kind="ReVOS mask_dict.sqlite or mask_dict.json",
     )
+    # Prefer the indexed source tar over a directory. This avoids expanding
+    # tens of thousands of small JPEGs onto shared filesystems; it also makes
+    # an interrupted legacy extraction harmless.
     frame_source = _first_existing(
-        [root / "JPEGImages", root / "JPEGImages.zip", root / split / "JPEGImages"],
-        kind="ReVOS JPEGImages directory or ZIP",
+        [
+            root / "ReVOS.tar",
+            root / "JPEGImages.zip",
+            root / "JPEGImages",
+            root / split / "JPEGImages",
+        ],
+        kind="ReVOS indexed tar, JPEGImages directory, or ZIP",
     )
     videos = _read_json(metadata_path).get("videos", {})
     by_category: dict[str, list[dict[str, Any]]] = {name: [] for name in categories}
