@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import math
 import os
 import shutil
+import sqlite3
 import statistics
 import time
 import types
@@ -134,13 +136,16 @@ def _find_frame(directory: Path, video_id: str, frame_id: str) -> Path:
 
 
 class DatasetProvider:
-    """Materialize ordered frames once and keep large mask maps/ZIP indexes warm."""
+    """Materialize a video once and keep archives/mask indexes warm per worker."""
 
     def __init__(self, cache_root: Path) -> None:
         self.cache_root = cache_root.resolve()
         self._archives: dict[Path, zipfile.ZipFile] = {}
         self._archive_names: dict[Path, set[str]] = {}
         self._mask_dicts: dict[Path, dict[str, list[dict[str, Any] | None]]] = {}
+        self._mask_databases: dict[Path, sqlite3.Connection] = {}
+        self._mask_sequences: dict[tuple[Path, str], list[dict[str, Any] | None]] = {}
+        self._palette_cache: dict[tuple[Path, str, str], np.ndarray] = {}
 
     def _archive(self, path: Path) -> zipfile.ZipFile:
         if path not in self._archives:
@@ -149,23 +154,42 @@ class DatasetProvider:
             self._archive_names[path] = set(archive.namelist())
         return self._archives[path]
 
-    def _frame_payload(self, source: Path, video_id: str, frame_id: str) -> bytes:
+    def _member(self, source: Path, candidates: tuple[str, ...]) -> bytes:
         archive = self._archive(source)
         names = self._archive_names[source]
-        candidates = (
-            f"{video_id}/{frame_id}.jpg",
-            f"JPEGImages/{video_id}/{frame_id}.jpg",
-            f"{video_id}/{frame_id}.jpeg",
-            f"JPEGImages/{video_id}/{frame_id}.jpeg",
-        )
         name = next((value for value in candidates if value in names), None)
         if name is None:
-            raise FileNotFoundError(f"missing frame {video_id}/{frame_id} in {source}")
+            raise FileNotFoundError(
+                f"none of {list(candidates)} exists in archive {source}"
+            )
         return archive.read(name)
 
-    def _materialize_frames(self, unit: dict[str, Any]) -> list[Path]:
+    def _frame_payload(self, source: Path, video_id: str, frame_id: str) -> bytes:
+        candidates = tuple(
+            f"{prefix}{video_id}/{frame_id}{suffix}"
+            for prefix in (
+                "",
+                "JPEGImages/",
+                "train/JPEGImages/",
+                "valid/JPEGImages/",
+                "val/JPEGImages/",
+                "test/JPEGImages/",
+            )
+            for suffix in (".jpg", ".jpeg", ".png")
+        )
+        return self._member(source, candidates)
+
+    def materialize_frames(self, unit: dict[str, Any]) -> list[Path]:
+        """Create one shared frame directory per dataset/split/video."""
+
         source = Path(unit["frame_source"])
-        destination = self.cache_root / "frames" / unit["sample_id"]
+        destination = (
+            self.cache_root
+            / "frames"
+            / unit["dataset"]
+            / unit["split"]
+            / unit["video_id"]
+        )
         paths: list[Path] = []
         for index, frame_id in enumerate(unit["frame_ids"]):
             output = destination / f"{index:05d}.jpg"
@@ -177,35 +201,84 @@ class DatasetProvider:
             paths.append(output)
         return paths
 
+    def _palette_labels(self, source: Path, video_id: str, frame_id: str) -> np.ndarray:
+        key = (source, video_id, frame_id)
+        cached = self._palette_cache.get(key)
+        if cached is not None:
+            return cached
+        if source.is_dir():
+            candidates = (
+                source / video_id / f"{frame_id}.png",
+                source / "Annotations" / video_id / f"{frame_id}.png",
+                source / "train" / "Annotations" / video_id / f"{frame_id}.png",
+            )
+            path = next((value for value in candidates if value.is_file()), None)
+            if path is None:
+                raise FileNotFoundError(f"missing annotation {video_id}/{frame_id}.png")
+            labels = np.asarray(Image.open(path))
+        else:
+            payload = self._member(
+                source,
+                (
+                    f"{video_id}/{frame_id}.png",
+                    f"Annotations/{video_id}/{frame_id}.png",
+                    f"train/Annotations/{video_id}/{frame_id}.png",
+                ),
+            )
+            labels = np.asarray(Image.open(io.BytesIO(payload)))
+        # A video batch normally has <=36 frames. Keep only its palette frames;
+        # the worker explicitly clears this cache between videos.
+        self._palette_cache[key] = labels
+        return labels
+
     def _ref_targets(self, unit: dict[str, Any]) -> list[tuple[str, list[np.ndarray | None]]]:
         annotation_value = unit.get("annotation_source")
         if not annotation_value or unit["target_source_expected"] != "official_dataset_ground_truth":
             return []
-        annotation_root = Path(annotation_value)
+        source = Path(annotation_value)
         rows: list[tuple[str, list[np.ndarray | None]]] = []
         for object_id in unit.get("target_object_ids", []):
             masks: list[np.ndarray | None] = []
             for frame_id in unit["frame_ids"]:
-                path = annotation_root / unit["video_id"] / f"{frame_id}.png"
-                if not path.is_file():
+                try:
+                    labels = self._palette_labels(source, unit["video_id"], frame_id)
+                except FileNotFoundError:
                     masks.append(None)
                     continue
-                labels = np.asarray(Image.open(path))
                 mask = labels == int(object_id)
                 masks.append(mask if bool(mask.any()) else None)
             rows.append((str(object_id), masks))
         return rows
 
+    def _mask_sequence(self, path: Path, annotation_id: str) -> list[dict[str, Any] | None]:
+        key = (path, annotation_id)
+        if key in self._mask_sequences:
+            return self._mask_sequences[key]
+        if path.suffix == ".sqlite":
+            connection = self._mask_databases.get(path)
+            if connection is None:
+                connection = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+                self._mask_databases[path] = connection
+            row = connection.execute(
+                "SELECT sequence_json FROM masks WHERE annotation_id = ?", (annotation_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(annotation_id)
+            sequence = json.loads(row[0])
+        else:
+            if path not in self._mask_dicts:
+                self._mask_dicts[path] = json.loads(path.read_text(encoding="utf-8"))
+            sequence = self._mask_dicts[path][annotation_id]
+        self._mask_sequences[key] = sequence
+        return sequence
+
     def _revos_targets(self, unit: dict[str, Any]) -> list[tuple[str, list[np.ndarray | None]]]:
         if unit["negative"]:
             return []
         path = Path(unit["mask_dict_path"])
-        if path not in self._mask_dicts:
-            self._mask_dicts[path] = json.loads(path.read_text(encoding="utf-8"))
-        mask_dict = self._mask_dicts[path]
         rows: list[tuple[str, list[np.ndarray | None]]] = []
         for annotation_id in unit.get("target_annotation_ids", []):
-            sequence = mask_dict[str(annotation_id)]
+            sequence = self._mask_sequence(path, str(annotation_id))
             masks = [
                 decode_rle(sequence[index]) if index < len(sequence) and sequence[index] else None
                 for index in range(len(unit["frame_ids"]))
@@ -213,23 +286,31 @@ class DatasetProvider:
             rows.append((str(annotation_id), masks))
         return rows
 
+    def target_sequences(
+        self, unit: dict[str, Any]
+    ) -> list[tuple[str, list[np.ndarray | None]]]:
+        if unit["dataset"] == "ref_youtube_vos":
+            return self._ref_targets(unit)
+        if unit["dataset"] == "revos":
+            return self._revos_targets(unit)
+        raise ValueError(f"unsupported dataset: {unit['dataset']}")
+
     def materialize(
         self, unit: dict[str, Any]
     ) -> tuple[list[Path], list[tuple[str, list[np.ndarray | None]]]]:
-        frames = self._materialize_frames(unit)
-        if unit["dataset"] == "ref_youtube_vos":
-            targets = self._ref_targets(unit)
-        elif unit["dataset"] == "revos":
-            targets = self._revos_targets(unit)
-        else:
-            raise ValueError(f"unsupported dataset: {unit['dataset']}")
-        return frames, targets
+        return self.materialize_frames(unit), self.target_sequences(unit)
+
+    def finish_video(self) -> None:
+        self._palette_cache.clear()
+        self._mask_sequences.clear()
 
     def close(self) -> None:
         for archive in self._archives.values():
             archive.close()
+        for connection in self._mask_databases.values():
+            connection.close()
         self._archives.clear()
-
+        self._mask_databases.clear()
 
 def _normalize_mask(value: Any) -> np.ndarray:
     mask = np.asarray(value, dtype=np.bool_)
@@ -350,8 +431,16 @@ def process_unit(
     provider: DatasetProvider,
     predictor,
     output_threshold: float = 0.5,
+    shared_frame_paths: list[Path] | None = None,
+    shared_session_id: str | None = None,
+    prompt_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    frame_paths, gt_sequences = provider.materialize(unit)
+    if unit["negative"]:
+        frame_paths: list[Path] = []
+        gt_sequences: list[tuple[str, list[np.ndarray | None]]] = []
+    else:
+        frame_paths = shared_frame_paths or provider.materialize_frames(unit)
+        gt_sequences = provider.target_sequences(unit)
     text = unit["text"]
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -361,6 +450,8 @@ def process_unit(
         "cohort": unit["cohort"],
         "annotation_protocol": unit["annotation_protocol"],
         "provenance_warning": unit.get("provenance_warning"),
+        "dataset_root": unit.get("dataset_root"),
+        "frame_source": unit.get("frame_source"),
         "video_id": unit["video_id"],
         "expression_id": unit["expression_id"],
         "text": text,
@@ -416,10 +507,25 @@ def process_unit(
     if needs_sam and predictor is None:
         raise RuntimeError("SAM3.1 predictor is required for this sample")
 
-    session_id: str | None = None
+    session_id = shared_session_id
+    owns_session = False
     accepted_context: list[dict[str, Any]] = []
+    cache = prompt_cache if prompt_cache is not None else {}
+
+    def tracks_for(prompt: str) -> list[dict[str, Any]]:
+        key = prompt.strip().casefold()
+        if key not in cache:
+            cache[key] = _sam_tracklets_for_prompt(
+                predictor,
+                session_id=session_id,
+                prompt=prompt,
+                frame_count=len(frame_paths),
+                output_threshold=output_threshold,
+            )
+        return cache[key]
+
     try:
-        if needs_sam:
+        if needs_sam and session_id is None:
             session = predictor.handle_request(
                 {
                     "type": "start_session",
@@ -429,16 +535,11 @@ def process_unit(
                 }
             )
             session_id = session["session_id"]
+            owns_session = True
 
         if needs_target_sam:
             target_prompt = str(target.get("surface") or target.get("sam_prompt") or "").strip()
-            raw_targets = _sam_tracklets_for_prompt(
-                predictor,
-                session_id=session_id,
-                prompt=target_prompt,
-                frame_count=len(frame_paths),
-                output_threshold=output_threshold,
-            )
+            raw_targets = tracks_for(target_prompt)
             audit = {
                 "role": "main_referent",
                 "sam_prompt": target_prompt,
@@ -484,13 +585,7 @@ def process_unit(
         # Without the main referent, context-only output is not a valid BCC pair.
         for prompt_group in prompt_groups if target_ids else []:
             prompt = prompt_group["sam_prompt"]
-            raw_tracks = _sam_tracklets_for_prompt(
-                predictor,
-                session_id=session_id,
-                prompt=prompt,
-                frame_count=len(frame_paths),
-                output_threshold=output_threshold,
-            )
+            raw_tracks = tracks_for(prompt)
             audit = {
                 "role": "context_entity",
                 "sam_prompt": prompt,
@@ -548,7 +643,7 @@ def process_unit(
                 audit["retained_tracklets"] += 1
             record["sam_prompt_audit"].append(audit)
     finally:
-        if session_id is not None:
+        if owns_session and session_id is not None:
             predictor.handle_request(
                 {"type": "close_session", "session_id": session_id, "run_gc_collect": False}
             )

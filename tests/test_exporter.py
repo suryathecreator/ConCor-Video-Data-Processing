@@ -21,7 +21,7 @@ def test_export_is_flat_and_accounts_for_pending(tmp_path) -> None:
                 "sample_id": "done",
                 "dataset": "ref_youtube_vos",
                 "split": "train",
-                "cohort": "first_frame",
+                "cohort": "full_video",
                 "video_id": "v",
                 "expression_id": "0",
                 "target_source_expected": "official_dataset_ground_truth",
@@ -31,7 +31,7 @@ def test_export_is_flat_and_accounts_for_pending(tmp_path) -> None:
                 "sample_id": "pending",
                 "dataset": "ref_youtube_vos",
                 "split": "train",
-                "cohort": "first_frame",
+                "cohort": "full_video",
                 "video_id": "w",
                 "expression_id": "0",
                 "target_source_expected": "official_dataset_ground_truth",
@@ -55,7 +55,7 @@ def test_export_is_flat_and_accounts_for_pending(tmp_path) -> None:
         "sample_id": "done",
         "dataset": "ref_youtube_vos",
         "split": "train",
-        "cohort": "first_frame",
+        "cohort": "full_video",
         "video_id": "v",
         "expression_id": "0",
         "text": "an owl",
@@ -91,6 +91,7 @@ def test_export_is_flat_and_accounts_for_pending(tmp_path) -> None:
     assert manifest["sample_rows"] == 1
     assert manifest["tracklet_rows"] == 1
     assert pq.read_table(campaign / "export/tracklets.parquet").num_rows == 1
+    assert pq.read_table(campaign / "export/verification.parquet").num_rows == 1
     with (campaign / "export/run_ledger.csv").open() as handle:
         rows = list(csv.DictReader(handle))
     assert [row["status"] for row in rows] == ["completed", "pending"]

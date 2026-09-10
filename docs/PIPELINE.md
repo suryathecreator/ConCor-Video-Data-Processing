@@ -1,40 +1,27 @@
-# Tracklet-native correspondence pipeline
+# Pipeline
 
-The linguistic unit is an exact half-open character span `[start, end)`. The visual unit is a tracklet: one instance ID with a frame-aligned sequence of COCO RLE masks. The temporal dimension changes the visual representation, not the correspondence rules.
+## Extraction
 
-## Main referent
+spaCy parses each official expression. The loader stores exact half-open Unicode character spans independently from normalized SAM prompts. Concrete visible people, objects, body parts, garments, surfaces, and stuff are eligible. Abstract concepts, taxonomy words, viewpoint-camera mentions, quoted titles, and unsafe generic thing/object prompts are audited but not segmented.
 
-For Ref-YouTube-VOS train and nonnegative ReVOS records, the official target masks remain authoritative. They are never rediscovered or replaced. If a Ref-YouTube-VOS split has no public masks, SAM3.1 is prompted for the main referring span; those tracks use source `sam3.1_main_referent` and are not presented as ground truth.
+A single span may link to several tracklets. Overlapping spans are legal, such as a hand and its possessor.
 
-One text span may identify multiple official or predicted tracks. This is needed for plural referring expressions. A single tracklet may also be linked from the main noun phrase and a later pronoun or possessive.
+## Tracking
 
-## Context extraction
+Work is dynamically claimed by video. A worker materializes frames once, initializes one SAM3.1 Object Multiplex state, and processes every pending instruction for that video. Repeated normalized prompts share one result inside the video batch. Multiplex output discovers several matching instances in one prompt call.
 
-spaCy parses each original expression. The extractor keeps articles and modifiers in the linked surface span while generating a short normalized SAM prompt. Independently visible people, objects, garments, body parts, surfaces, and stuff regions are eligible context.
+Official target sequences are inserted first when public. Ref-YT-VOS public val/test masks are withheld, so SAM3.1 supplies the main tracklet and provenance stays model-generated. ReVOS nonexistent descriptions become zero-tracklet negatives.
 
-Scene/meta words, events, taxonomic ranks, quoted titles, comparison classes, viewpoint `camera`, and generic `thing(s)`/`object` are not sent as semantic prompts. Every ignored candidate and reason remains in `extraction_json`; the decision is inspectable rather than silent.
+Tracks are removed when too short, under 64 pixels over the sequence, or below confidence thresholds. Context tracks at volume IoU >= 0.65 with a main track are discarded; context-context tracks at IoU >= 0.80 merge. Volume IoU sums intersection and union over aligned frames.
 
-## SAM3.1 and filtering
+## Checkpointing and races
 
-A long-lived SAM3.1 Object Multiplex predictor is loaded once per worker. Frames are materialized once in stable numeric order. Each unique prompt is issued once and all matching instances returned for that prompt are tracked together.
+Thirty-two array tasks inspect the same sorted video queue from different rotations. Exclusive video leases prevent simultaneous sessions for one video. Nested sample leases and atomic rename commits prevent duplicate/corrupt records. Leases heartbeat and become recoverable after a dead worker. Persistent errors stop after a bounded number of attempts.
 
-Tracks are retained when they:
+SIGUSR1 requests a drain: finish the active instruction, fsync its JSON, close the session, then requeue. Records, errors, worklists, and the shared frame cache live outside node-local storage. Mutable Torch/Triton/CUDA caches are job/task/restart-specific. Immutable checkpoint/runtime staging is node-shared under flock.
 
-- appear in at least one frame for videos of four frames or fewer, otherwise at least `max(2, ceil(5% × frames))` frames;
-- contain at least 64 foreground pixels over time;
-- have maximum confidence at least 0.55 and mean confidence at least 0.45.
+Eager SAM execution is the default because measured max-autotune warmup took roughly 23 minutes for this workload. Optional compiled mode remains available for a separately benchmarked long-lived campaign.
 
-Context tracks overlapping a main referent at temporal volume IoU ≥ 0.65 are removed. Context tracks overlapping an already retained context at IoU ≥ 0.80 are merged, and the merged track retains every prompt and text span.
+## Output
 
-## Dispositions
-
-- `complete_bcc`: main referent exists and every required context prompt returned at least one retained track.
-- `incomplete_context`: main referent exists, but at least one required context prompt returned no retained track.
-- `missing_main_referent`: a split without public ground truth produced no retained SAM main track.
-- `negative_unsegmentable`: an intentional ReVOS nonexistent-object negative with no tracklets.
-
-These labels describe pipeline completeness, not human-verified semantic correctness.
-
-## Recovery and scaling
-
-Each expression is an atomic JSON checkpoint. Array workers use stable modulo sharding and exclusive claim files, so concurrent workers do not duplicate samples. Generated frames are reused. A preemption signal stops new claims, finishes and fsyncs the active sample, then requeues the same worker. The final exporter can run after any array outcome and records incomplete work as `pending` or `failed` rather than hiding it.
+Every selected instruction is represented in run_ledger.csv as completed, failed, or pending. Export validates completed records and writes atomic Parquet outputs. verification.parquet is deliberately denormalized so a small offline verifier can load it without table joins.

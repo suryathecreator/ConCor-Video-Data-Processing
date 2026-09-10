@@ -71,7 +71,7 @@ def _unit(root, *, ground_truth: bool) -> dict:
         "sample_id": "sample",
         "dataset": "ref_youtube_vos",
         "split": "train" if ground_truth else "val",
-        "cohort": "first_frame",
+        "cohort": "full_video",
         "annotation_protocol": "public_full_video_expression",
         "provenance_warning": None,
         "frame_source": str(root / "frames"),

@@ -1,9 +1,10 @@
-"""Atomic per-sample claims and result commits for preemptible workers."""
+"""Atomic leases and result commits for preemptible, concurrent workers."""
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -30,9 +31,10 @@ def sample_claim(
     claim_path: Path,
     *,
     owner: str,
-    stale_after_seconds: int = 6 * 3600,
+    stale_after_seconds: int = 30 * 60,
+    heartbeat_seconds: int = 30,
 ) -> Iterator[bool]:
-    """Yield whether this worker owns the sample; recover only stale claims."""
+    """Acquire an exclusive, heartbeating lease and recover dead workers safely."""
 
     claim_path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -47,7 +49,9 @@ def sample_claim(
         except (OSError, ValueError, AttributeError):
             pass
         if same_owner or now - stat.st_mtime > stale_after_seconds:
-            stale = claim_path.with_suffix(claim_path.suffix + f".stale-{int(now)}")
+            stale = claim_path.with_suffix(
+                claim_path.suffix + f".stale-{int(now)}-{os.getpid()}"
+            )
             try:
                 claim_path.replace(stale)
             except FileNotFoundError:
@@ -65,10 +69,26 @@ def sample_claim(
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+    stopped = threading.Event()
+
+    def heartbeat() -> None:
+        while not stopped.wait(heartbeat_seconds):
+            try:
+                os.utime(claim_path, None)
+            except FileNotFoundError:
+                return
+
+    thread = threading.Thread(target=heartbeat, name="claim-heartbeat", daemon=True)
+    thread.start()
     try:
         yield True
     finally:
+        stopped.set()
+        thread.join(timeout=max(1, heartbeat_seconds))
         try:
-            claim_path.unlink()
-        except FileNotFoundError:
-            pass
+            current = json.loads(claim_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            current = {}
+        if current.get("owner") == owner:
+            claim_path.unlink(missing_ok=True)

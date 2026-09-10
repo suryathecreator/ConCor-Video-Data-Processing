@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ConCor Video Verification</title><link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <div><p class="eyebrow">ConCor | offline review</p><h1>Video correspondence verification</h1></div>
+  <div class="toolbar">
+    <label class="toggle"><input id="quickKeys" type="checkbox"> 1/2 quick decisions</label>
+    <button id="importButton" class="quiet">Import decisions</button><input id="importFile" type="file" accept=".json,application/json" hidden>
+    <button id="downloadButton" class="quiet">Download decisions.json</button>
+    <button id="exportButton">Export updated Parquet</button>
+  </div>
+</header>
+<section class="progress-shell">
+  <div class="progress-copy"><span id="progressText">Loading...</span><span id="saveState">Local checkpoint ready</span></div>
+  <div class="progress-track"><div id="progressBar"></div></div>
+</section>
+<main>
+  <aside>
+    <div class="nav"><button id="prevButton" class="quiet">&larr; Previous</button><label>Video <input id="videoNumber" type="number" min="1"></label><button id="nextButton" class="quiet">Next &rarr;</button></div>
+    <div id="videoMeta" class="meta"></div>
+    <div class="decision-row"><button id="acceptButton" class="accept">1 | Accept video</button><button id="rejectButton" class="reject">2 | Reject video</button></div>
+    <button id="revertVideoButton" class="quiet wide">Revert entire video</button>
+    <div class="viewer"><canvas id="canvas"></canvas><div class="frame-controls"><button id="prevFrame" class="quiet">&larr;</button><input id="frameSlider" type="range" min="0" max="0" value="0"><button id="nextFrame" class="quiet">&rarr;</button><span id="frameLabel"></span></div></div>
+    <div class="legend-note">Select an instruction below to display its tracklets. Click a colored tracklet name to show or hide it.</div>
+  </aside>
+  <section>
+    <div class="section-heading"><div><p class="eyebrow">All language for this video</p><h2 id="instructionTitle">Instructions</h2></div><span id="videoStatus" class="status undecided">Undecided</span></div>
+    <div id="instructions"></div>
+  </section>
+</main>
+<template id="instructionTemplate">
+  <article class="instruction-card">
+    <div class="card-head"><div><span class="instruction-index"></span><span class="cohort"></span></div><button class="revert-instruction quiet">Revert instruction</button></div>
+    <textarea class="caption" rows="3" spellcheck="true"></textarea>
+    <div class="edit-grid">
+      <section><h3>Text spans</h3><p class="hint">Select text above, choose one or more tracklets, then add the link. One span may link to many tracklets.</p><div class="span-list"></div><button class="add-link">Link selected text to checked tracklets</button></section>
+      <section><h3>Tracklets</h3><p class="hint">Checkboxes choose link targets. Click the colored name to toggle its overlay; delete removes it from export.</p><div class="tracklet-list"></div></section>
+    </div>
+    <details><summary>Extraction and SAM audit</summary><pre class="audit"></pre></details>
+  </article>
+</template>
+<script src="app.js"></script>
+</body></html>

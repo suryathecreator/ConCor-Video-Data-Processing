@@ -1,115 +1,131 @@
 # ConCor Video Data Processing
 
-ConCor Video turns referring-video annotations into **text span ↔ instance tracklet** correspondences. It keeps an official target tracklet when the dataset provides one, extracts independently visible context entities with spaCy, and uses SAM 3.1 Object Multiplex to segment and track those additional entities. The result preserves both directions of the relationship: every tracklet knows its exact text spans, and every span knows all of its tracklets.
+ConCor Video converts referring-video annotations into text-span <-> instance-tracklet correspondences. It preserves an official target tracklet when one is public, extracts independently visible context entities with spaCy, and uses SAM 3.1 Object Multiplex to segment and track additional entities. A plural text span may link to several tracklets, and every relationship is represented in both directions.
 
-This is the cleaned research release of the Ref-YouTube-VOS/ReVOS pipeline. It is deterministic at selection time, checkpointed per expression, safe to shard across preemptible workers, and exports ordinary Parquet tables plus a full run ledger for a future verification interface.
+This is a clean, checkpointable research pipeline for Ref-YouTube-VOS and ReVOS. It includes a completely local browser interface for video-level verification and Parquet editing.
 
-## Quick setup
+## Ref-YouTube-VOS terminology
 
-You need Python 3.12+, CUDA 12.6+, a compatible NVIDIA GPU, access to the gated SAM 3.1 checkpoint, and the upstream datasets under their own terms.
+"First-frame expression" describes how the language was authored: an annotator saw only the first frame when writing the expression. It does **not** mean running a full-video expression on frame zero. The original benchmark reports 3,978 videos (3,471/202/305 train/val/test), about 15k full-video-authored expressions, about 13k first-frame-authored expressions, and about 131k frame masks.
 
-```bash
+Only the **full-video-authored language** is in the current public release. This repository therefore has no pseudo-first-frame mode and processes complete videos only. It never relabels frame-zero inference as the retired first-frame annotation cohort.
+
+## Public corpus covered
+
+Counts are checked before GPU work. The current public full-video release and ReVOS metadata produce:
+
+| Priority | Dataset / split / type | Videos | Instructions |
+|---|---|---:|---:|
+| evaluation | Ref-YT-VOS val, full video | 202 | 834 |
+| evaluation | Ref-YT-VOS test, full video | 305 | 1,262 |
+| evaluation | ReVOS val, explicit | 416 shared videos | 3,130 |
+| evaluation | ReVOS val, implicit | 416 shared videos | 2,475 |
+| evaluation | ReVOS val, nonexistent | 416 shared videos | 217 |
+| train | Ref-YT-VOS train, full video | 3,471 | 12,913 |
+| train | ReVOS train, explicit | 626 shared videos | 16,941 |
+| train | ReVOS train, implicit | 626 shared videos | 12,203 |
+| train | ReVOS train, nonexistent | 626 shared videos | 108 |
+
+Evaluation totals 923 dataset/split videos and 7,918 instructions. Train totals 4,097 dataset/split videos and 42,165 instructions. ReVOS category video counts overlap, so they must not be summed.
+
+The public Ref-YT-VOS valid metadata is the original 507-video pool. The loader removes the public 305-video competition-test subset to recover the disjoint 202-video validation split.
+
+## Setup
+
+You need Python 3.11+, a compatible NVIDIA GPU, the SAM 3.1 code/checkpoint, and dataset access under upstream terms.
+
+~~~bash
 git clone https://github.com/suryathecreator/ConCor-Video-Data-Processing.git
 cd ConCor-Video-Data-Processing
 bash scripts/setup.sh
 source .venv/bin/activate
 hf auth login
 bash scripts/download_model.sh
-```
+~~~
 
-`scripts/setup.sh` installs PyTorch CUDA 12.8 by default and clones the official SAM 3 repository. Set `INSTALL_GPU=0` for a CPU-only preparation/export environment, or set `TORCH_INDEX_URL` and `SAM31_REPO_ROOT` for an existing cluster runtime.
+To stage the public Ref-YT-VOS and ReVOS mirrors resumably:
 
-## Run locally
+~~~bash
+bash scripts/prepare_public_datasets.sh /data/concor-video
+~~~
 
-Ref-YouTube-VOS train, full sequence:
+The script keeps Ref-YT-VOS in validated ZIP archives, extracts ReVOS, and builds a shared read-only SQLite index for its large mask dictionary. Downloads resume after interruption.
 
-```bash
-DATASET=refytvos DATA_ROOT=/data/ref-youtube-vos SPLIT=train \
-REF_MODE=full_video LIMIT=100 CAMPAIGN_ROOT=$PWD/outputs/ref-train-100 \
-bash scripts/run_local.sh
-```
+## Process one split
 
-Process only the first frame of each selected Ref-YouTube-VOS expression:
+Ref-YT-VOS always processes full videos:
 
-```bash
-DATASET=refytvos DATA_ROOT=/data/ref-youtube-vos SPLIT=train \
-REF_MODE=first_frame LIMIT=100 CAMPAIGN_ROOT=$PWD/outputs/ref-first-100 \
-bash scripts/run_local.sh
-```
+~~~bash
+DATASET=refytvos DATA_ROOT=/data/concor-video/ref-youtube-vos SPLIT=val \
+CAMPAIGN_ROOT=$PWD/outputs/ref-val bash scripts/run_local.sh
+~~~
 
-The public Ref-YouTube-VOS language release contains **full-video-authored expressions only**. `REF_MODE=first_frame` therefore limits model processing to frame zero; it does not claim to recover the retired first-frame-language annotations. `SPLIT` may be `train`, `val`, or `test`. Train uses official target masks when they are present. Public val/test data do not include target masks, so their main referent is explicitly stored as a SAM3.1 prediction rather than mislabeled as ground truth.
+Choose any ReVOS reasoning categories:
 
-ReVOS train or validation, with any combination of categories:
+~~~bash
+DATASET=revos DATA_ROOT=/data/concor-video/ReVOS SPLIT=val \
+REVOS_CATEGORIES="implicit explicit nonexistent" \
+CAMPAIGN_ROOT=$PWD/outputs/revos-val bash scripts/run_local.sh
+~~~
 
-```bash
-DATASET=revos DATA_ROOT=/data/ReVOS SPLIT=train \
-REVOS_CATEGORIES="implicit explicit" LIMIT_PER_CATEGORY=100 \
-CAMPAIGN_ROOT=$PWD/outputs/revos-train-200 bash scripts/run_local.sh
-```
+Use LIMIT for Ref-YT-VOS or LIMIT_PER_CATEGORY for ReVOS. SPLIT supports train/val/test for Ref-YT-VOS and train/val for ReVOS.
 
-Use `SPLIT=val` for validation. Add `nonexistent` to retain nonexistent-object descriptions as intentional zero-tracklet negatives. Omit `LIMIT`/`LIMIT_PER_CATEGORY` to process every matching expression.
+## Submit the complete public corpus
 
-## Submit to Slurm
+This is the exact reproducible command shape used for the full campaign:
 
-The same variables work with the checkpoint-friendly array launcher:
+~~~bash
+DATA_ROOT=/data/concor-video \
+CAMPAIGN_BASE=/outputs/concor-video-full \
+PYTHON_BIN=$PWD/.venv/bin/python \
+SAM31_REPO_ROOT=$PWD/external/sam3 \
+SAM31_CHECKPOINT=$PWD/checkpoints/sam3.1/sam3.1_multiplex.pt \
+SLURM_PARTITION=ckpt SLURM_ACCOUNT=your-account GPU_GRES=gpu:a40:1 \
+NUM_WORKERS=32 bash scripts/submit_public_corpus.sh
+~~~
 
-```bash
-DATASET=refytvos DATA_ROOT=/data/ref-youtube-vos SPLIT=train \
-REF_MODE=full_video LIMIT=1000 CAMPAIGN_ROOT=$PWD/outputs/ref-train-1k \
-NUM_WORKERS=8 SLURM_PARTITION=your_gpu_partition \
-SLURM_ACCOUNT=your_account GPU_GRES=gpu:a40:1 \
-bash scripts/submit_slurm.sh
-```
+The launcher submits a 32-task, one-A40 evaluation array with no percent concurrency cap; Slurm decides how many run. The train array has lower priority and starts after evaluation. Both are preemptible and resume from atomic per-instruction records.
 
-For another partition or GPU, change only `SLURM_PARTITION` and `GPU_GRES` (for example `gpu:h200:1` or your site's generic `gpu:1`). The worker asks for one GPU and has no cluster-specific path or account baked in. Set `TIME_LIMIT`, `MEMORY`, `CPUS_PER_TASK`, or `EXPORT_PARTITION` when your scheduler needs different resources.
-
-Workers keep SAM3.1 loaded, assign samples deterministically by array index, stage weights and compilation caches in a job-specific node-local directory, and atomically commit one JSON record per expression. On `USR1`, a worker finishes its current expression and requeues. Rerunning the same command reuses the worklist and completed records.
+For one custom split, use scripts/submit_slurm.sh. Change SLURM_PARTITION, SLURM_ACCOUNT, and GPU_GRES for another cluster/GPU.
 
 ## Pipeline
 
-1. **Select expressions** — dataset adapters select a seeded subset from the requested split, view, and reasoning categories.
-2. **Extract entities** — spaCy separates exact text spans from short semantic prompts. Concrete context such as `arm`, `book`, or `road` is eligible; abstract/meta language and unsafe generic `thing(s)` are retained in the audit but not prompted.
-3. **Anchor the referent** — official dataset tracklets are used when available. Otherwise SAM3.1 predicts the main referent and the provenance says so.
-4. **Track context** — one warm SAM3.1 Multiplex predictor grounds each unique prompt and tracks all matching instances. A plural span can link to several tracklets.
-5. **Filter and link** — low-confidence/short/tiny tracks are removed; temporal IoU merges duplicates. Exact Unicode character spans are linked in both directions.
-6. **Export** — records become `samples.parquet`, `tracklets.parquet`, `links.parquet`, and `run_ledger.csv`.
+1. Select official expressions and assert release counts.
+2. Parse exact referring/context spans with spaCy; keep the display span separate from the short SAM prompt.
+3. Anchor the main referent to public ground truth, or label it explicitly as a SAM3.1 prediction when challenge masks are withheld.
+4. Open one SAM3.1 session per video; reuse decoded frames, video state, and repeated prompt results across all its instructions.
+5. Filter tiny/short/low-confidence tracks and merge duplicate temporal tracks by volume IoU.
+6. Validate both tracklet-to-span groups and span-to-tracklet links.
+7. Atomically checkpoint each instruction and export flat tables, a complete ledger, and one verifier-ready Parquet.
 
-See [the pipeline notes](docs/PIPELINE.md), [dataset layouts](docs/DATASETS.md), [output contract](docs/OUTPUT_FORMAT.md), and [cluster notes](docs/SLURM.md).
+Nonexistent ReVOS descriptions are preserved as intentional zero-tracklet negatives.
 
-## Output at a glance
+## Offline verification
 
-```text
-outputs/my-run/
-  worklist.json
-  worklist-extraction-audit.md
-  records/<sample_id>.json
-  errors/<sample_id>.json
-  cache/frames/<sample_id>/*.jpg
-  export/
-    samples.parquet
-    tracklets.parquet
-    links.parquet
-    run_ledger.csv
-    manifest.json
-```
+~~~bash
+concor-video verify \
+  --parquet outputs/my-run/export/verification.parquet \
+  --media-root /data/concor-video \
+  --decisions edits/decisions.json \
+  --output exports/verified.parquet \
+  --port 8000
+~~~
 
-`tracklets.parquet` is the direct verification input: one row per temporal instance, with scalar metadata and JSON columns for aligned COCO RLE masks, frame IDs, frame files, and linked spans. `samples.parquet` retains completed nonexistent-object negatives even though they have no tracklet rows. The ledger covers every selected expression and labels it `completed`, `failed`, or `pending`.
+Open http://127.0.0.1:8000. All instructions for one video appear together. You can edit language, create a span by selecting text, link it to one or many tracklets, delete spans/tracklets, revert an instruction or entire video, and accept/reject by video. Optional 1/2 quick keys accept/reject and advance. Decisions autosave in browser storage; import/export decisions.json works across sessions, and **Export updated Parquet** downloads a new file without overwriting the source.
 
-## Repository layout
+See [verification details](verification/README.md), [pipeline notes](docs/PIPELINE.md), [dataset layouts](docs/DATASETS.md), [output contract](docs/OUTPUT_FORMAT.md), and [Slurm notes](docs/SLURM.md).
 
-```text
-src/concor_video/   dataset adapters, extraction, SAM3.1 processing, validation, export
-scripts/            setup, checkpoint download, local and Slurm launchers
-slurm/              portable worker and export jobs
-schema/             record and Parquet field contracts
-docs/               data, pipeline, output, and cluster details
-tests/              CPU-only unit and integration tests
-```
+## Layout
 
-## Scope and limitations
+~~~text
+src/concor_video/  adapters, extraction, SAM3.1 processing, validation, export/server
+verification/      offline browser UI and decision schema
+scripts/           setup, staging, local and Slurm launchers
+slurm/             portable worker, preparation, worklist, and export jobs
+schema/            machine-readable record contracts
+tests/             CPU-only unit/integration tests
+~~~
 
-SAM masks and spaCy extraction are useful but not perfect. `complete_bcc` means every required prompt returned a retained tracklet and the representation passed deterministic integrity checks; it does not replace human verification. In particular, a strong semantic prompt can still select the wrong instance, and language heuristics can over- or under-extract contextual entities. The audit fields and flat Parquet layout are intentionally kept so those mistakes can be reviewed later.
+Generated data, credentials, checkpoints, caches, and media are ignored. SAM/spaCy output remains fallible; complete_bcc means the deterministic representation checks passed, not that a human verified the semantic target. The verifier exists to correct those residual errors.
 
-Code is MIT licensed. Ref-YouTube-VOS, ReVOS, SAM 3.1, and their media/checkpoints retain their own licenses and access terms. ReVOS is non-commercial CC BY-NC-SA 4.0. No dataset media, model weights, generated outputs, private paths, or credentials are included here.
-
-If this is useful, please cite the upstream *Grounding as Concept Correspondence*, SAM 3, URVOS/Ref-YouTube-VOS, and VISA/ReVOS work as applicable.
+Code is MIT licensed. Ref-YouTube-VOS, ReVOS, and SAM 3.1 retain their own terms. ReVOS is non-commercial CC BY-NC-SA 4.0. Please cite the upstream Grounding as Concept Correspondence, SAM 3, URVOS/Ref-YouTube-VOS, and VISA/ReVOS work as applicable.

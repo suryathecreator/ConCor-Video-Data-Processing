@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import random
 import re
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
 
 REF_SPLITS = {"train", "val", "test"}
-REF_MODES = {"full_video", "first_frame"}
 REVOS_SPLITS = {"train", "val"}
 REVOS_CATEGORIES = {"implicit", "explicit", "nonexistent"}
 REVOS_TYPE_NAMES = {0: "explicit", 1: "implicit", 2: "nonexistent"}
@@ -107,51 +107,85 @@ def _ref_split_dir(root: Path, split: str) -> Path:
     )
 
 
+def _ref_frame_source(root: Path, split: str, split_dir: Path) -> Path:
+    archive_names = {
+        "train": ("train.zip",),
+        "val": ("valid.zip", "val.zip"),
+        "test": ("test_ytvos.zip", "test.zip"),
+    }[split]
+    return _first_existing(
+        [split_dir / "JPEGImages", root / "JPEGImages"]
+        + [root / "archives" / name for name in archive_names]
+        + [root / name for name in archive_names],
+        kind=f"Ref-YouTube-VOS {split} JPEGImages directory or archive",
+    )
+
+
+def _json_member(path: Path, candidates: Iterable[str]) -> dict[str, Any] | None:
+    if not path.is_file() or path.suffix.lower() != ".zip":
+        return None
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        member = next((name for name in candidates if name in names), None)
+        return json.loads(archive.read(member)) if member else None
+
+
 def build_refytvos_units(
     data_root: Path,
     *,
     split: str,
-    mode: str,
     limit: int | None,
     seed: int,
     one_expression_per_video: bool = False,
 ) -> list[dict[str, Any]]:
-    """Load public full-video expressions and choose full-sequence/one-frame processing."""
+    """Load only public full-video-authored expressions and complete sequences."""
 
     if split not in REF_SPLITS:
         raise ValueError(f"unsupported Ref-YouTube-VOS split: {split}")
-    if mode not in REF_MODES:
-        raise ValueError(f"unsupported Ref-YouTube-VOS mode: {mode}")
     root = data_root.resolve()
     expression_path = _ref_expression_path(root, split)
     split_dir = _ref_split_dir(root, split)
-    frame_dir = _first_existing(
-        [split_dir / "JPEGImages", root / "JPEGImages"],
-        kind="Ref-YouTube-VOS JPEGImages directory",
+    frame_source = _ref_frame_source(root, split, split_dir)
+    annotation_candidates = [
+        split_dir / "Annotations", root / "Annotations",
+        root / "archives" / "train.zip", root / "train.zip",
+    ]
+    annotation_source = next(
+        (path.resolve() for path in annotation_candidates
+         if path.is_dir() or (split == "train" and path.is_file())),
+        None,
     )
-    annotation_candidates = [split_dir / "Annotations", root / "Annotations"]
-    annotation_dir = next((path.resolve() for path in annotation_candidates if path.is_dir()), None)
     meta_candidates = [split_dir / "meta.json", root / "meta.json"]
     meta_path = next((path.resolve() for path in meta_candidates if path.is_file()), None)
-    categories = _read_json(meta_path).get("videos", {}) if meta_path else {}
+    metadata = _read_json(meta_path) if meta_path else _json_member(
+        frame_source, ("train/meta.json", "meta.json")
+    )
+    categories = (metadata or {}).get("videos", {})
     videos = _read_json(expression_path).get("videos", {})
+
+    # Public `valid` is the original 507-video pool; public `test` is a
+    # 305-video subset. The competition validation split is the 202-video
+    # set difference, preventing duplicate work when both splits are run.
+    if split == "val":
+        try:
+            test_path = _ref_expression_path(root, "test")
+        except FileNotFoundError:
+            test_path = None
+        if test_path is not None:
+            test_video_ids = set(_read_json(test_path).get("videos", {}))
+            videos = {key: value for key, value in videos.items() if key not in test_video_ids}
 
     rows: list[dict[str, Any]] = []
     for video_id, video in videos.items():
-        all_frames = [str(value) for value in video.get("frames", [])]
-        if not all_frames:
+        frames = [str(value) for value in video.get("frames", [])]
+        if not frames:
             continue
-        frames = all_frames if mode == "full_video" else all_frames[:1]
         for expression_id, expression in video.get("expressions", {}).items():
             text = str(expression.get("exp", "")).strip()
             if not text:
                 continue
             object_ids = _normalize_object_ids(expression.get("obj_id"))
-            has_ground_truth = bool(
-                annotation_dir
-                and object_ids
-                and (annotation_dir / str(video_id) / f"{frames[0]}.png").is_file()
-            )
+            has_ground_truth = bool(annotation_source and object_ids)
             category = "unknown"
             if object_ids:
                 category = str(
@@ -163,22 +197,17 @@ def build_refytvos_units(
             rows.append(
                 {
                     "sample_id": (
-                        f"refytvos__{split}__{mode}__{_safe(str(video_id))}"
+                        f"refytvos__{split}__full_video__{_safe(str(video_id))}"
                         f"__e{_safe(str(expression_id))}"
                     ),
                     "dataset": "ref_youtube_vos",
                     "split": split,
-                    "cohort": mode,
+                    "cohort": "full_video",
                     "annotation_protocol": "public_full_video_expression",
-                    "provenance_warning": (
-                        "first_frame processes one frame from the public full-video-language "
-                        "release; it is not the retired first-frame-language annotation subset"
-                        if mode == "first_frame"
-                        else None
-                    ),
+                    "provenance_warning": None,
                     "dataset_root": str(root),
-                    "frame_source": str(frame_dir),
-                    "annotation_source": str(annotation_dir) if annotation_dir else None,
+                    "frame_source": str(frame_source),
+                    "annotation_source": str(annotation_source) if annotation_source else None,
                     "mask_dict_path": None,
                     "video_id": str(video_id),
                     "expression_id": str(expression_id),
@@ -194,10 +223,7 @@ def build_refytvos_units(
                 }
             )
     return _sample(
-        rows,
-        limit=limit,
-        seed=seed,
-        one_expression_per_video=one_expression_per_video,
+        rows, limit=limit, seed=seed, one_expression_per_video=one_expression_per_video
     )
 
 
@@ -234,8 +260,13 @@ def build_revos_units(
     root = data_root.resolve()
     metadata_path = _revos_metadata_path(root, split)
     mask_dict_path = _first_existing(
-        [root / "mask_dict.json", root / split / "mask_dict.json"],
-        kind="ReVOS mask_dict.json",
+        [
+            root / "mask_dict.sqlite",
+            root / "mask_dict.json",
+            root / split / "mask_dict.sqlite",
+            root / split / "mask_dict.json",
+        ],
+        kind="ReVOS mask_dict.sqlite or mask_dict.json",
     )
     frame_source = _first_existing(
         [root / "JPEGImages", root / "JPEGImages.zip", root / split / "JPEGImages"],

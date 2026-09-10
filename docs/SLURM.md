@@ -1,30 +1,32 @@
-# Slurm and arbitrary GPU partitions
+# Slurm
 
-The launcher contains no user, account, filesystem, partition, or GPU-model defaults. Supply your site values at submission time:
+## Full public campaign
 
-```bash
-DATASET=revos DATA_ROOT=/datasets/ReVOS SPLIT=val \
-REVOS_CATEGORIES="implicit explicit nonexistent" \
-CAMPAIGN_ROOT=$PWD/outputs/revos-val \
-NUM_WORKERS=4 SLURM_PARTITION=gpu SLURM_ACCOUNT=my_account \
-GPU_GRES=gpu:1 bash scripts/submit_slurm.sh
-```
+~~~bash
+DATA_ROOT=/data/concor-video \
+CAMPAIGN_BASE=/outputs/concor-video-full \
+PYTHON_BIN=$PWD/.venv/bin/python \
+SAM31_REPO_ROOT=$PWD/external/sam3 \
+SAM31_CHECKPOINT=$PWD/checkpoints/sam3.1/sam3.1_multiplex.pt \
+SLURM_PARTITION=ckpt SLURM_ACCOUNT=your-account GPU_GRES=gpu:a40:1 \
+NUM_WORKERS=32 bash scripts/submit_public_corpus.sh
+~~~
 
-Named resources work too:
+The DAG is:
 
-```bash
-GPU_GRES=gpu:a40:1   # one A40 per worker
-GPU_GRES=gpu:h200:1  # one H200 per worker
-```
+~~~text
+prepare data -> build evaluation worklist -> evaluation GPU[0-31] -> evaluation export
+             -> build train worklist -------> train GPU[0-31] -----> train export
+~~~
 
-SAM3.1 runs on one sufficiently capable GPU per worker. Increase `NUM_WORKERS` for data parallelism; do not assign the same physical GPU to multiple workers. Defaults are 16 CPU cores, 120 GB RAM, and 12 hours. Override `CPUS_PER_TASK`, `MEMORY`, and `TIME_LIMIT` as needed.
+Train GPU work additionally waits for the evaluation array and is submitted with a positive nice value. Arrays use 0-31, not an application-side percent cap; available resources and site policy provide scheduling limits.
 
-The export job is CPU-only. Set `EXPORT_PARTITION` if your cluster has a dedicated CPU partition. It uses an `afterany` dependency so even a partially failed worker array produces a truthful ledger and Parquet files for completed records. Resubmit the same campaign to fill pending/failed records, then rerun `concor-video export`.
+## Portability
 
-For short campaigns, eager inference is usually faster because compilation may not amortize. For a long campaign:
+Required settings are SLURM_PARTITION, SLURM_ACCOUNT, and GPU_GRES. One worker requires one GPU. Change gpu:a40:1 to gpu:h200:1, gpu:a100:1, or your site's generic request without code changes. Tune CPU, memory, and time through CPUS_PER_TASK, MEMORY, and TIME_LIMIT.
 
-```bash
-COMPILE_MODEL=1 ... bash scripts/submit_slurm.sh
-```
+PYTHON_RUNTIME_ARCHIVE may point to a tarball whose top level is site-packages/. Jobs unpack it once per node under a lock and prepend it to PYTHONPATH. The SAM checkpoint is likewise copied once per node. This avoids thousands of shared-filesystem imports and repeated 3+ GB checkpoint reads.
 
-Each task uses a job-and-array-specific node-local cache and checkpoint copy, which prevents workers from corrupting one another. Model source and weights remain shared read-only inputs.
+## Resumption
+
+The same campaign can be submitted again. Existing records are skipped, stale leases are recovered, and only pending/retryable instructions run. Workers handle USR1 ten minutes before scheduled termination and requeue themselves. Submission IDs are appended to CAMPAIGN_BASE/submissions.txt.

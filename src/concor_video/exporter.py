@@ -23,6 +23,10 @@ SAMPLE_SCHEMA = pa.schema(
         ("dataset", pa.string()),
         ("split", pa.string()),
         ("cohort", pa.string()),
+        ("annotation_protocol", pa.string()),
+        ("provenance_warning", pa.string()),
+        ("dataset_root", pa.string()),
+        ("frame_source", pa.string()),
         ("video_id", pa.string()),
         ("expression_id", pa.string()),
         ("text", pa.string()),
@@ -41,6 +45,34 @@ SAMPLE_SCHEMA = pa.schema(
         ("runtime_seconds", pa.float64()),
     ]
 )
+
+VERIFICATION_SCHEMA = pa.schema(
+    [
+        ("sample_id", pa.string()),
+        ("dataset", pa.string()),
+        ("split", pa.string()),
+        ("cohort", pa.string()),
+        ("annotation_protocol", pa.string()),
+        ("provenance_warning", pa.string()),
+        ("dataset_root", pa.string()),
+        ("frame_source", pa.string()),
+        ("video_id", pa.string()),
+        ("expression_id", pa.string()),
+        ("text", pa.string()),
+        ("negative", pa.bool_()),
+        ("target_source", pa.string()),
+        ("disposition", pa.string()),
+        ("frame_ids_json", pa.string()),
+        ("frame_files_json", pa.string()),
+        ("tracklets_json", pa.string()),
+        ("groups_json", pa.string()),
+        ("span_links_json", pa.string()),
+        ("extraction_json", pa.string()),
+        ("sam_prompt_audit_json", pa.string()),
+        ("runtime_seconds", pa.float64()),
+    ]
+)
+
 
 TRACKLET_SCHEMA = pa.schema(
     [
@@ -115,6 +147,10 @@ def _sample_row(record: dict[str, Any]) -> dict[str, Any]:
         "dataset": record["dataset"],
         "split": record["split"],
         "cohort": record["cohort"],
+        "annotation_protocol": record.get("annotation_protocol", ""),
+        "provenance_warning": record.get("provenance_warning"),
+        "dataset_root": record.get("dataset_root"),
+        "frame_source": record.get("frame_source"),
         "video_id": record["video_id"],
         "expression_id": record["expression_id"],
         "text": record["text"],
@@ -133,6 +169,33 @@ def _sample_row(record: dict[str, Any]) -> dict[str, Any]:
         "runtime_seconds": float(record.get("runtime", {}).get("seconds", 0.0)),
     }
 
+
+
+def _verification_row(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sample_id": record["sample_id"],
+        "dataset": record["dataset"],
+        "split": record["split"],
+        "cohort": record["cohort"],
+        "annotation_protocol": record.get("annotation_protocol", ""),
+        "provenance_warning": record.get("provenance_warning"),
+        "dataset_root": record.get("dataset_root"),
+        "frame_source": record.get("frame_source"),
+        "video_id": record["video_id"],
+        "expression_id": record["expression_id"],
+        "text": record["text"],
+        "negative": bool(record["negative"]),
+        "target_source": str(record.get("pipeline", {}).get("target_source", "unknown")),
+        "disposition": record["disposition"],
+        "frame_ids_json": _json(record["frame_ids"]),
+        "frame_files_json": _json(record.get("frame_files", [])),
+        "tracklets_json": _json(record["tracklets"]),
+        "groups_json": _json(record["groups"]),
+        "span_links_json": _json(record["span_links"]),
+        "extraction_json": _json(record.get("extraction", {})),
+        "sam_prompt_audit_json": _json(record.get("sam_prompt_audit", [])),
+        "runtime_seconds": float(record.get("runtime", {}).get("seconds", 0.0)),
+    }
 
 def _group_by_tracklet(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
     values: dict[str, dict[str, Any]] = {}
@@ -252,6 +315,11 @@ def export_campaign(
         (_sample_row(record) for record in records),
         SAMPLE_SCHEMA,
     )
+    verification_count = _atomic_parquet(
+        output_dir / "verification.parquet",
+        (_verification_row(record) for record in records),
+        VERIFICATION_SCHEMA,
+    )
     tracklet_count = _atomic_parquet(
         output_dir / "tracklets.parquet", _tracklet_rows(records), TRACKLET_SCHEMA
     )
@@ -275,12 +343,14 @@ def export_campaign(
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "worklist_units": len(worklist["units"]),
         "sample_rows": sample_count,
+        "verification_rows": verification_count,
         "tracklet_rows": tracklet_count,
         "link_rows": link_count,
         "status_counts": dict(sorted(status_counts.items())),
         "disposition_counts": dict(sorted(dispositions.items())),
         "tables": {
             "samples": "samples.parquet",
+            "verification": "verification.parquet",
             "tracklets": "tracklets.parquet",
             "links": "links.parquet",
             "ledger": "run_ledger.csv",

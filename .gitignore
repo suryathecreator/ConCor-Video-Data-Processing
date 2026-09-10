@@ -20,3 +20,6 @@ slurm_logs/
 *.out
 *.err
 .env
+# Local verification checkpoints and exports
+edits/
+exports/
