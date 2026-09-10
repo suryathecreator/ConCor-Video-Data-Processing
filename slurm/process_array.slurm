@@ -13,11 +13,47 @@ NODE_ASSET_ROOT="/tmp/${USER}-concor-video-assets"
 mkdir -p "${JOB_CACHE_ROOT}/"{torch,triton,cuda,xdg,pycache} "${NODE_ASSET_ROOT}"
 runtime_root=""
 if [[ -n "${PYTHON_RUNTIME_ARCHIVE:-}" ]]; then
-  runtime_key="$(stat -c '%s-%Y' "${PYTHON_RUNTIME_ARCHIVE}")"; runtime_root="${NODE_ASSET_ROOT}/runtime-${runtime_key}"
-  ( flock 9; if [[ ! -s "${runtime_root}/.complete" ]]; then temp="${runtime_root}.part-${SLURM_JOB_ID}-${task_id}"; rm -rf "${temp}"; mkdir -p "${temp}"; tar -xzf "${PYTHON_RUNTIME_ARCHIVE}" -C "${temp}"; touch "${temp}/.complete"; rm -rf "${runtime_root}"; mv "${temp}" "${runtime_root}"; fi ) 9>"${NODE_ASSET_ROOT}/runtime.lock"
+  runtime_key="$(stat -c '%s-%Y' "${PYTHON_RUNTIME_ARCHIVE}")"
+  runtime_candidate="${NODE_ASSET_ROOT}/runtime-${runtime_key}"
+  if (
+    flock 9
+    find "${NODE_ASSET_ROOT}" -maxdepth 1 -type d -name 'runtime-*.part-*' -exec rm -rf -- {} +
+    if [[ ! -s "${runtime_candidate}/.complete" ]]; then
+      temp="${runtime_candidate}.part-${SLURM_JOB_ID}-${task_id}"
+      mkdir -p "${temp}"
+      if ! tar -xzf "${PYTHON_RUNTIME_ARCHIVE}" -C "${temp}"; then
+        rm -rf "${temp}"
+        exit 1
+      fi
+      touch "${temp}/.complete"
+      rm -rf "${runtime_candidate}"
+      mv "${temp}" "${runtime_candidate}"
+    fi
+  ) 9>"${NODE_ASSET_ROOT}/runtime.lock"; then
+    runtime_root="${runtime_candidate}"
+  else
+    echo "[staging] node-local runtime unavailable; using shared Python environment" >&2
+  fi
 fi
-checkpoint_key="$(stat -c '%s-%Y' "${SAM31_CHECKPOINT}")"; LOCAL_CHECKPOINT="${NODE_ASSET_ROOT}/sam31-${checkpoint_key}.pt"
-( flock 9; if [[ ! -s "${LOCAL_CHECKPOINT}" ]]; then part="${LOCAL_CHECKPOINT}.part-${SLURM_JOB_ID}-${task_id}"; cp --reflink=auto "${SAM31_CHECKPOINT}" "${part}"; mv "${part}" "${LOCAL_CHECKPOINT}"; fi ) 9>"${NODE_ASSET_ROOT}/checkpoint.lock"
+checkpoint_key="$(stat -c '%s-%Y' "${SAM31_CHECKPOINT}")"
+checkpoint_candidate="${NODE_ASSET_ROOT}/sam31-${checkpoint_key}.pt"
+LOCAL_CHECKPOINT="${SAM31_CHECKPOINT}"
+if (
+  flock 9
+  find "${NODE_ASSET_ROOT}" -maxdepth 1 -type f -name 'sam31-*.pt.part-*' -delete
+  if [[ ! -s "${checkpoint_candidate}" ]]; then
+    part="${checkpoint_candidate}.part-${SLURM_JOB_ID}-${task_id}"
+    if ! cp --reflink=auto "${SAM31_CHECKPOINT}" "${part}"; then
+      rm -f "${part}"
+      exit 1
+    fi
+    mv "${part}" "${checkpoint_candidate}"
+  fi
+) 9>"${NODE_ASSET_ROOT}/checkpoint.lock"; then
+  LOCAL_CHECKPOINT="${checkpoint_candidate}"
+else
+  echo "[staging] node-local checkpoint unavailable; using shared checkpoint" >&2
+fi
 export XDG_CACHE_HOME="${JOB_CACHE_ROOT}/xdg" TORCHINDUCTOR_CACHE_DIR="${JOB_CACHE_ROOT}/torch" TRITON_CACHE_DIR="${JOB_CACHE_ROOT}/triton" CUDA_CACHE_PATH="${JOB_CACHE_ROOT}/cuda" PYTHONPYCACHEPREFIX="${JOB_CACHE_ROOT}/pycache"
 export PYTHONPATH="${REPO_ROOT}/src:${SAM31_REPO_ROOT}${runtime_root:+:${runtime_root}/site-packages}${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HOME="${HF_HOME:-${CAMPAIGN_ROOT}/shared-cache/huggingface}"
