@@ -389,6 +389,10 @@ def _sam_tracklets_for_prompt(
     )
     masks_by_object: dict[int, dict[int, np.ndarray]] = {}
     scores_by_object: dict[int, list[float]] = {}
+    # The filter only asks whether total area reaches 64 pixels. Saturating at
+    # that threshold avoids rescanning hundreds of full-resolution masks per
+    # long-video tracklet after propagation.
+    pixel_evidence_by_object: dict[int, int] = {}
     try:
         responses = predictor.handle_stream_request(
             {
@@ -412,9 +416,13 @@ def _sam_tracklets_for_prompt(
             ).reshape(-1)
             for local_index, object_id_raw in enumerate(object_ids):
                 object_id = int(object_id_raw)
-                masks_by_object.setdefault(object_id, {})[frame_index] = _normalize_mask(
-                    masks[local_index]
-                )
+                mask = _normalize_mask(masks[local_index])
+                masks_by_object.setdefault(object_id, {})[frame_index] = mask
+                pixel_evidence = pixel_evidence_by_object.get(object_id, 0)
+                if pixel_evidence < 64:
+                    pixel_evidence_by_object[object_id] = min(
+                        64, pixel_evidence + int(np.count_nonzero(mask))
+                    )
                 score = float(scores[local_index]) if local_index < len(scores) else 1.0
                 scores_by_object.setdefault(object_id, []).append(score)
     except RuntimeError as error:
@@ -433,7 +441,7 @@ def _sam_tracklets_for_prompt(
                 "sam_object_id": object_id,
                 "arrays": arrays,
                 "present_frames": _present_frame_count(arrays),
-                "total_pixels": sum(int(mask.sum()) for mask in arrays if mask is not None),
+                "total_pixels": pixel_evidence_by_object.get(object_id, 0),
                 "mean_score": statistics.fmean(scores) if scores else 0.0,
                 "max_score": max(scores, default=0.0),
             }
