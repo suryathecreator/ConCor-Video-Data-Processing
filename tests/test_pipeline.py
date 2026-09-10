@@ -185,6 +185,19 @@ def test_rle_and_temporal_iou_round_trip() -> None:
     assert temporal_iou([mask, None], [decoded, None]) == 1.0
 
 
+def test_vectorized_rle_round_trips_edge_and_random_masks() -> None:
+    rng = np.random.default_rng(20260910)
+    masks = [
+        np.zeros((2, 3), dtype=bool),
+        np.ones((2, 3), dtype=bool),
+        rng.random((31, 47)) > 0.73,
+    ]
+    assert encode_rle(masks[0])["counts"] == [6]
+    assert encode_rle(masks[1])["counts"] == [0, 6]
+    for mask in masks:
+        assert np.array_equal(decode_rle(encode_rle(mask)), mask)
+
+
 def test_memory_safe_mode_microbatches_and_restores_fast_defaults():
     predictor = SimpleNamespace(
         model=SimpleNamespace(

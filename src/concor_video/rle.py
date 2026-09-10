@@ -75,16 +75,17 @@ def encode_rle(mask: np.ndarray | None) -> dict | None:
     if array.ndim != 2:
         raise ValueError(f"expected HxW mask, got shape {array.shape}")
     flat = array.reshape(-1, order="F")
-    counts: list[int] = []
-    current = False
-    run = 0
-    for value in flat:
-        foreground = bool(value)
-        if foreground == current:
-            run += 1
-        else:
-            counts.append(run)
-            run = 1
-            current = foreground
-    counts.append(run)
+    if flat.size == 0:
+        counts = [0]
+    else:
+        # Locate run boundaries in vectorized C rather than iterating over every
+        # full-resolution pixel in Python. COCO RLE always starts with the
+        # background run, so a foreground first pixel requires a leading zero.
+        changes = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+        boundaries = np.concatenate(
+            (np.asarray([0]), changes, np.asarray([flat.size]))
+        )
+        counts = np.diff(boundaries).astype(np.int64).tolist()
+        if bool(flat[0]):
+            counts.insert(0, 0)
     return {"size": [int(array.shape[0]), int(array.shape[1])], "counts": counts}
