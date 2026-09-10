@@ -12,7 +12,7 @@ Work is dynamically claimed by video. A worker materializes frames once, initial
 
 Official target sequences are inserted first when public. Ref-YT-VOS public val/test masks are withheld, so SAM3.1 supplies the main tracklet and provenance stays model-generated. ReVOS nonexistent descriptions become zero-tracklet negatives.
 
-Tracks are removed when too short, under 64 pixels over the sequence, or below confidence thresholds. Context tracks at volume IoU >= 0.65 with a main track are discarded; context-context tracks at IoU >= 0.80 merge. Volume IoU sums intersection and union over aligned frames.
+Tracks are removed when too short, under 64 pixels over the sequence, or below confidence thresholds. Context tracks at volume IoU >= 0.65 with a main track are discarded; context-context tracks at IoU >= 0.80 merge. Volume IoU sums intersection and union over aligned frames. A missing or empty official target annotation is preserved as an audited `missing_main_referent` record instead of aborting a worker. A malformed zero-length language span is repaired from its extracted head and recorded in the extraction notes.
 
 ## Checkpointing and races
 

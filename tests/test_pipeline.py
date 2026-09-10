@@ -134,6 +134,42 @@ def test_missing_public_target_is_labeled_sam_prediction(tmp_path) -> None:
     assert record["pipeline"]["target_source"] == "sam3.1_multiplex"
 
 
+def test_missing_official_target_is_audited_not_raised(tmp_path) -> None:
+    unit = _unit(tmp_path / "inputs", ground_truth=True)
+    unit["target_object_ids"] = [99]
+    record = process_unit(
+        unit,
+        provider=DatasetProvider(tmp_path / "cache"),
+        predictor=FakePredictor(),
+    )
+    assert record["disposition"] == "missing_main_referent"
+    assert record["tracklets"] == []
+    assert record["sam_prompt_audit"][0]["rejections"][0]["reason"] == (
+        "official_target_tracklet_empty_or_missing"
+    )
+
+
+def test_invalid_existing_target_span_is_repaired(tmp_path) -> None:
+    unit = _unit(tmp_path / "inputs", ground_truth=True)
+    unit["text"] = "seating(s) designed for rest."
+    unit["extraction"]["target"].update(
+        {"surface": "", "start": 0, "end": 0, "head": "seating", "sam_prompt": "seating"}
+    )
+    unit["sam_prompt_groups"] = []
+    record = process_unit(
+        unit,
+        provider=DatasetProvider(tmp_path / "cache"),
+        predictor=FakePredictor(),
+    )
+    assert record["groups"][0]["text_spans"] == [
+        {"start": 0, "end": 7, "text": "seating"}
+    ]
+    assert (
+        "repaired invalid main-referent span deterministically"
+        in record["extraction"]["notes"]
+    )
+
+
 def test_rle_and_temporal_iou_round_trip() -> None:
     mask = np.zeros((8, 11), dtype=bool)
     mask[2:7, 3:9] = True

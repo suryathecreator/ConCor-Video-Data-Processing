@@ -306,6 +306,17 @@ def extract_entities(
         target_start, target_end = 0, len(text)
         target_head = str(target_category or "entity").casefold()
         target_prompt = target_head
+    # Parenthesized plural notation such as ``seating(s)`` can make spaCy
+    # expose a noun chunk whose action-trimming boundary collapses to zero.
+    # Preserve an exact, useful referent span instead of emitting [0, 0).
+    if target_start >= target_end:
+        match = re.search(
+            re.escape(target_head or target_prompt), text, flags=re.IGNORECASE
+        )
+        if match is not None:
+            target_start, target_end = match.span()
+        else:
+            target_start, target_end = 0, len(text)
     candidates: list[EntityCandidate] = [
         _make_candidate(
             index=0,

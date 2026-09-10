@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import io
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import statistics
@@ -465,6 +467,7 @@ def process_unit(
         frame_paths = shared_frame_paths or provider.materialize_frames(unit)
         gt_sequences = provider.target_sequences(unit)
     text = unit["text"]
+    extraction = copy.deepcopy(unit["extraction"])
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "sample_id": unit["sample_id"],
@@ -484,7 +487,7 @@ def process_unit(
         "tracklets": [],
         "groups": [],
         "span_links": [],
-        "extraction": unit["extraction"],
+        "extraction": extraction,
         "sam_prompt_audit": [],
         "pipeline": {
             "target_source": unit["target_source_expected"],
@@ -499,9 +502,23 @@ def process_unit(
         validate_record(record)
         return record
 
-    target = unit["extraction"]["target"]
-    target_spans = [make_span(text, int(target["start"]), int(target["end"]))]
-    target_spans.extend(unit["extraction"].get("target_coreference_spans", []))
+    target = extraction["target"]
+    target_start, target_end = int(target["start"]), int(target["end"])
+    if not (0 <= target_start < target_end <= len(text)):
+        needle = str(target.get("head") or target.get("sam_prompt") or "").strip()
+        match = re.search(re.escape(needle), text, flags=re.IGNORECASE) if needle else None
+        if match is not None:
+            target_start, target_end = match.span()
+        else:
+            target_start, target_end = 0, len(text)
+        target.update(
+            {"start": target_start, "end": target_end, "surface": text[target_start:target_end]}
+        )
+        extraction.setdefault("notes", []).append(
+            "repaired invalid main-referent span deterministically"
+        )
+    target_spans = [make_span(text, target_start, target_end)]
+    target_spans.extend(extraction.get("target_coreference_spans", []))
     target_arrays: list[list[np.ndarray | None]] = []
     target_ids: list[str] = []
     for index, (source_id, arrays) in enumerate(gt_sequences, 1):
@@ -521,12 +538,26 @@ def process_unit(
         )
 
     if unit["target_source_expected"] == "official_dataset_ground_truth" and not target_ids:
-        raise RuntimeError("official target tracklet is empty or missing")
+        record["sam_prompt_audit"].append(
+            {
+                "role": "main_referent",
+                "sam_prompt": None,
+                "surface_spans": [target["surface"]],
+                "raw_tracklets": 0,
+                "retained_tracklets": 0,
+                "rejections": [
+                    {
+                        "reason": "official_target_tracklet_empty_or_missing",
+                        "source_annotation_ids": list(unit.get("target_annotation_ids", [])),
+                    }
+                ],
+            }
+        )
     needs_target_sam = (
         unit["target_source_expected"] != "official_dataset_ground_truth" and not target_ids
     )
     prompt_groups = list(unit.get("sam_prompt_groups", []))
-    needs_sam = needs_target_sam or bool(prompt_groups)
+    needs_sam = needs_target_sam or (bool(prompt_groups) and bool(target_ids))
     if needs_sam and predictor is None:
         raise RuntimeError("SAM3.1 predictor is required for this sample")
 
