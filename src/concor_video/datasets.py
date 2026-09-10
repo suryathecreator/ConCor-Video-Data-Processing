@@ -111,7 +111,10 @@ def _ref_frame_source(root: Path, split: str, split_dir: Path) -> Path:
     archive_names = {
         "train": ("train.zip",),
         "val": ("valid.zip", "val.zip"),
-        "test": ("test_ytvos.zip", "test.zip"),
+        # Public test expressions are a 305-video subset of the original
+        # 507-video valid pool, and their frames therefore live in valid.zip.
+        # test_ytvos.zip is a separate 747-video challenge-media archive.
+        "test": ("valid.zip", "val.zip", "test_ytvos.zip", "test.zip"),
     }[split]
     return _first_existing(
         [split_dir / "JPEGImages", root / "JPEGImages"]

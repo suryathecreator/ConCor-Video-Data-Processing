@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 import numpy as np
 from PIL import Image
 from concor_video.datasets import build_refytvos_units, build_revos_units
@@ -42,6 +43,28 @@ def test_refytvos_validation_excludes_competition_test_videos(tmp_path) -> None:
     rows=build_refytvos_units(root,split="val",limit=None,seed=1)
     assert [row["video_id"] for row in rows]==["val-a"]
     assert rows[0]["target_source_expected"]=="sam3.1_multiplex"
+
+
+def test_refytvos_public_test_uses_valid_pool_media(tmp_path) -> None:
+    root = tmp_path / "ref"
+    (root / "meta_expressions/test").mkdir(parents=True)
+    (root / "archives").mkdir()
+    videos = {
+        "test-a": {
+            "frames": ["00000"],
+            "expressions": {"0": {"exp": "a dog", "obj_id": 1}},
+        }
+    }
+    (root / "meta_expressions/test/meta_expressions.json").write_text(
+        json.dumps({"videos": videos})
+    )
+    with zipfile.ZipFile(root / "archives/valid.zip", "w") as archive:
+        archive.writestr("valid/JPEGImages/test-a/00000.jpg", b"jpeg")
+    with zipfile.ZipFile(root / "archives/test_ytvos.zip", "w") as archive:
+        archive.writestr("test/JPEGImages/unrelated/00000.jpg", b"jpeg")
+
+    row = build_refytvos_units(root, split="test", limit=None, seed=1)[0]
+    assert row["frame_source"] == str((root / "archives/valid.zip").resolve())
 
 
 def test_revos_category_selection(tmp_path) -> None:
