@@ -111,7 +111,9 @@ concor-video verify \
   --port 8000
 ~~~
 
-Open http://127.0.0.1:8000. All instructions for one video appear together. You can edit language, create a span by selecting text, link it to one or many tracklets, delete spans/tracklets, revert an instruction or entire video, and accept/reject by video. Optional 1/2 quick keys accept/reject and advance. Decisions autosave in browser storage; import/export decisions.json works across sessions, and **Export updated Parquet** downloads a new file without overwriting the source.
+Open http://127.0.0.1:8000. All instructions for one video appear together. You can edit language, create exact span-to-tracklet links, delete spans/tracklets or whole instructions, play or step through frames, and accept/reject by video. Decisions checkpoint in browser storage and, at a selectable interval, to `--decisions`; export saves and downloads both the decisions and updated Parquet without overwriting the source.
+
+For compact storage, current campaign exports combine all training rows in one file and all evaluation rows (validation/test where publicly available) in another. Every row retains explicit `dataset` and `split` fields, so a small dataset/split filter can separate them losslessly; the final Hugging Face publishing wrapper will emit those splits.
 
 See [verification details](verification/README.md), [pipeline notes](docs/PIPELINE.md), [dataset layouts](docs/DATASETS.md), [output contract](docs/OUTPUT_FORMAT.md), and [Slurm notes](docs/SLURM.md).
 

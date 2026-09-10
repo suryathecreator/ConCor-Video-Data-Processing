@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from concor_video.verification import apply_decisions
+from pathlib import Path
+
+from concor_video.verification import _candidate_media_sources, apply_decisions
 
 
 def _row():
@@ -31,3 +33,19 @@ def test_decisions_delete_tracklet_and_rebuild_bidirectional_links() -> None:
 def test_rejected_video_is_removed() -> None:
     decisions={"videos":{"revos::val::v1":{"status":"rejected","instructions":{}}}}
     assert apply_decisions([_row()],decisions)==[]
+
+
+def test_discarded_instruction_is_removed_without_rejecting_video() -> None:
+    decisions={"videos":{"revos::val::v1":{"status":"accepted","instructions":{"s1":{"discarded":True}}}}}
+    assert apply_decisions([_row()], decisions)==[]
+
+
+def test_media_root_rebases_processing_host_archive_path(tmp_path: Path) -> None:
+    archive = tmp_path / "ref-youtube-vos" / "archives" / "valid.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"zip")
+    row = {
+        "frame_source": "/mmfs1/gscratch/datasets/concor-video/ref-youtube-vos/archives/valid.zip",
+        "dataset_root": None,
+    }
+    assert archive in _candidate_media_sources([tmp_path], row)

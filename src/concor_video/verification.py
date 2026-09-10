@@ -49,6 +49,40 @@ def _video_key(row: dict[str, Any]) -> str:
     return f"{row['dataset']}::{row['split']}::{row['video_id']}"
 
 
+def _candidate_media_sources(
+    media_roots: list[Path], row: dict[str, Any]
+) -> list[Path]:
+    """Resolve archived source paths beneath one or more local media roots.
+
+    Exported rows retain provenance paths from the processing host. For portable
+    review, each suffix of that path is tried beneath every ``--media-root``. Thus
+    ``.../ref-youtube-vos/archives/valid.zip`` naturally resolves below a local
+    root without rewriting the Parquet.
+    """
+
+    stored = [
+        Path(value)
+        for value in (row.get("frame_source"), row.get("dataset_root"))
+        if value
+    ]
+    candidates: list[Path] = []
+    for root in media_roots:
+        candidates.append(root)
+        for source in stored:
+            parts = source.parts[1:] if source.is_absolute() else source.parts
+            for start in range(len(parts)):
+                candidates.append(root.joinpath(*parts[start:]))
+    candidates.extend(stored)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.expanduser())
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate.expanduser())
+    return unique
+
+
 def _public_row(row: dict[str, Any]) -> dict[str, Any]:
     value = dict(row)
     for key in JSON_COLUMNS:
@@ -131,6 +165,8 @@ def apply_decisions(
         if status == "rejected":
             continue
         edit = video.get("instructions", {}).get(row["sample_id"], {})
+        if edit.get("discarded") or edit.get("status") == "rejected":
+            continue
         text = str(edit.get("text", row["text"]))
         tracklets = _loads(row["tracklets_json"], [])
         removed = {str(value) for value in edit.get("deleted_tracklet_ids", [])}
@@ -204,7 +240,8 @@ class VerificationState:
         self.rows = load_verification_rows(parquet_paths)
         self.fingerprint = dataset_fingerprint(self.rows)
         self.output_path = output_path
-        self.media_roots = media_roots
+        self.decisions_path = decisions_path or output_path.with_name("decisions.json")
+        self.media_roots = [root.expanduser() for root in media_roots]
         self.row_by_sample = {str(row["sample_id"]): row for row in self.rows}
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self.rows:
@@ -220,6 +257,24 @@ class VerificationState:
         self._tar_archives: dict[Path, IndexedTarReader] = {}
         self._archive_names: dict[Path, set[str]] = {}
         self._archive_lock = threading.Lock()
+        self._decisions_lock = threading.Lock()
+
+    def save_decisions(self, value: dict[str, Any]) -> dict[str, Any]:
+        decisions = _normalize_decisions(value, self.fingerprint)
+        decisions["updated_at"] = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(decisions, ensure_ascii=False, indent=2).encode("utf-8")
+        with self._decisions_lock:
+            self.decisions_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.decisions_path.with_suffix(
+                self.decisions_path.suffix + f".{os.getpid()}.part"
+            )
+            with temporary.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(self.decisions_path)
+            self.decisions = decisions
+        return decisions
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -227,6 +282,11 @@ class VerificationState:
             "source_fingerprint": self.fingerprint,
             "video_count": len(self.videos),
             "instruction_count": len(self.rows),
+            "storage": {
+                "decisions_path": str(self.decisions_path),
+                "output_path": str(self.output_path),
+                "browser_storage_key": f"concor-video:{self.fingerprint}",
+            },
             "videos": [
                 {
                     "index": index,
@@ -271,9 +331,7 @@ class VerificationState:
             raise IndexError(frame_index)
         frame_id = str(frame_ids[frame_index])
         candidates = self._member_candidates(row, frame_id)
-        sources = self.media_roots + [
-            Path(value) for value in (row.get("frame_source"), row.get("dataset_root")) if value
-        ]
+        sources = _candidate_media_sources(self.media_roots, row)
         for source in sources:
             if source.is_dir():
                 for relative in candidates:
@@ -291,7 +349,7 @@ class VerificationState:
                 with self._archive_lock:
                     archive = self._tar_archives.get(source)
                     if archive is None:
-                        archive = IndexedTarReader(source)
+                        archive = IndexedTarReader(source, auto_reindex=True)
                         self._tar_archives[source] = archive
                     try:
                         member, payload = archive.read(candidates)
@@ -361,19 +419,27 @@ def _handler(state: VerificationState):
                 self._error(400, str(error))
             except FileNotFoundError as error:
                 self._error(404, str(error))
+            except RuntimeError as error:
+                self._error(500, str(error))
 
         def do_POST(self) -> None:
-            if urllib.parse.urlparse(self.path).path != "/api/export":
+            endpoint = urllib.parse.urlparse(self.path).path
+            if endpoint not in {"/api/decisions", "/api/export"}:
                 self._error(404, "unknown endpoint")
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if length > 64 * 1024 * 1024:
                     raise ValueError("decisions payload is too large")
-                decisions = _normalize_decisions(
-                    json.loads(self.rfile.read(length)), state.fingerprint
-                )
-                decisions["updated_at"] = datetime.now(timezone.utc).isoformat()
+                decisions = state.save_decisions(json.loads(self.rfile.read(length)))
+                if endpoint == "/api/decisions":
+                    self._json(
+                        {
+                            "saved_at": decisions["updated_at"],
+                            "path": str(state.decisions_path),
+                        }
+                    )
+                    return
                 payload = write_verified_parquet(state.rows, decisions, state.output_path)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.apache.parquet")

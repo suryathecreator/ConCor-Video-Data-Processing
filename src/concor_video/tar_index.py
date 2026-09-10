@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import tarfile
@@ -9,9 +10,39 @@ from pathlib import Path
 from typing import Iterable
 
 
-def _source_signature(path: Path) -> tuple[int, int]:
+FINGERPRINT_VERSION = "sampled-sha256-v1"
+FINGERPRINT_CHUNK_BYTES = 1024 * 1024
+
+
+def _source_signature(path: Path) -> tuple[int, int, str]:
+    """Return a portable, inexpensive identity for a large archive.
+
+    Modification times are intentionally informational only: copying a tar between
+    Hyak and a workstation commonly changes them. Size plus deterministic samples
+    from the beginning, middle, and end detects stale/wrong copies without hashing
+    all 47 GB on every verifier startup.
+    """
+
     stat = path.stat()
-    return int(stat.st_size), int(stat.st_mtime_ns)
+    size = int(stat.st_size)
+    digest = hashlib.sha256()
+    digest.update(FINGERPRINT_VERSION.encode("ascii"))
+    digest.update(size.to_bytes(8, "big"))
+    offsets = sorted(
+        {
+            0,
+            max(0, size // 2 - FINGERPRINT_CHUNK_BYTES // 2),
+            max(0, size - FINGERPRINT_CHUNK_BYTES),
+        }
+    )
+    with path.open("rb", buffering=0) as source:
+        for offset in offsets:
+            source.seek(offset)
+            payload = source.read(min(FINGERPRINT_CHUNK_BYTES, size - offset))
+            digest.update(offset.to_bytes(8, "big"))
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return size, int(stat.st_mtime_ns), digest.hexdigest()
 
 
 def _valid_index(source: Path, index: Path) -> bool:
@@ -20,10 +51,11 @@ def _valid_index(source: Path, index: Path) -> bool:
     try:
         with sqlite3.connect(f"file:{index}?mode=ro&immutable=1", uri=True) as connection:
             values = dict(connection.execute("SELECT key, value FROM metadata"))
-            size, mtime_ns = _source_signature(source)
+            size, _mtime_ns, fingerprint = _source_signature(source)
             return (
                 int(values.get("source_size", -1)) == size
-                and int(values.get("source_mtime_ns", -1)) == mtime_ns
+                and values.get("source_fingerprint_version") == FINGERPRINT_VERSION
+                and values.get("source_content_fingerprint") == fingerprint
                 and int(values.get("member_count", 0)) > 0
             )
     except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -75,12 +107,14 @@ def index_tar(source: Path, destination: Path) -> int:
                     batch.clear()
         if batch:
             connection.executemany("INSERT INTO members VALUES (?, ?, ?)", batch)
-        size, mtime_ns = _source_signature(source)
+        size, mtime_ns, fingerprint = _source_signature(source)
         connection.executemany(
             "INSERT INTO metadata VALUES (?, ?)",
             [
                 ("source_size", str(size)),
                 ("source_mtime_ns", str(mtime_ns)),
+                ("source_fingerprint_version", FINGERPRINT_VERSION),
+                ("source_content_fingerprint", fingerprint),
                 ("member_count", str(count)),
             ],
         )
@@ -95,10 +129,20 @@ def index_tar(source: Path, destination: Path) -> int:
 class IndexedTarReader:
     """Read named members with SQLite lookups plus ``pread`` byte ranges."""
 
-    def __init__(self, source: Path, index: Path | None = None) -> None:
+    def __init__(
+        self,
+        source: Path,
+        index: Path | None = None,
+        *,
+        auto_reindex: bool = False,
+    ) -> None:
         self.source = source.resolve()
         self.index = (index or self.source.with_suffix(self.source.suffix + ".sqlite")).resolve()
-        if not _valid_index(self.source, self.index):
+        valid = _valid_index(self.source, self.index)
+        if auto_reindex and not valid:
+            index_tar(self.source, self.index)
+            valid = _valid_index(self.source, self.index)
+        if not valid:
             raise RuntimeError(
                 f"missing or stale tar index {self.index}; run index-revos-tar first"
             )

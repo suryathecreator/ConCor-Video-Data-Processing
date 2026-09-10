@@ -25,4 +25,4 @@ campaign/
 
 Within a record, groups maps tracklet IDs to text spans; span_links is the deterministic inverse. Character intervals are half-open. Tracklet masks align exactly with frame_ids; absent frames use null.
 
-The verifier groups rows by dataset, split, and video_id. Rejected videos are omitted from verified export. Deleted tracklets are removed, invalid/deleted links are removed, and edited exact spans rebuild span_links. Source Parquet is never overwritten.
+The verifier groups rows by dataset, split, and video_id. Rejected videos and individually discarded instructions are omitted from verified export. Deleted tracklets are removed, invalid/deleted links are removed, and edited exact spans rebuild span_links. Source Parquet is never overwritten.

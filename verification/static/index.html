@@ -9,9 +9,21 @@
   <div><p class="eyebrow">ConCor | offline review</p><h1>Video correspondence verification</h1></div>
   <div class="toolbar">
     <label class="toggle"><input id="quickKeys" type="checkbox"> 1/2 quick decisions</label>
+    <button id="playButton" class="quiet">Play</button>
+    <label class="toggle"><input id="loopPlayback" type="checkbox" checked> Loop video</label>
+    <details class="save-menu">
+      <summary>Saving</summary>
+      <div class="save-panel">
+        <label>Save decisions file every
+          <select id="autosaveSeconds"><option value="0">Off</option><option value="15">15 seconds</option><option value="30" selected>30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option></select>
+        </label>
+        <p id="storageInfo"></p>
+        <button id="saveNow" class="quiet">Save checkpoint now</button>
+        <button id="downloadButton" class="quiet">Download decisions.json</button>
+      </div>
+    </details>
     <button id="importButton" class="quiet">Import decisions</button><input id="importFile" type="file" accept=".json,application/json" hidden>
-    <button id="downloadButton" class="quiet">Download decisions.json</button>
-    <button id="exportButton">Export updated Parquet</button>
+    <button id="exportButton">Save + export both files</button>
   </div>
 </header>
 <section class="progress-shell">
@@ -34,7 +46,9 @@
 </main>
 <template id="instructionTemplate">
   <article class="instruction-card">
-    <div class="card-head"><div><span class="instruction-index"></span><span class="cohort"></span></div><button class="revert-instruction quiet">Revert instruction</button></div>
+    <div class="card-head"><div><span class="instruction-index"></span><span class="cohort"></span></div><div class="card-actions"><button class="discard-instruction danger">Discard instruction</button><button class="revert-instruction quiet">Revert instruction</button></div></div>
+    <div class="linked-caption" aria-label="Current exact span-to-tracklet links"></div>
+    <div class="link-map"></div>
     <textarea class="caption" rows="3" spellcheck="true"></textarea>
     <div class="edit-grid">
       <section><h3>Text spans</h3><p class="hint">Select text above, choose one or more tracklets, then add the link. One span may link to many tracklets.</p><div class="span-list"></div><button class="add-link">Link selected text to checked tracklets</button></section>
