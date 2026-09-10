@@ -23,7 +23,10 @@ export PYTHONPATH="${REPO_ROOT}/src:${SAM31_REPO_ROOT}${runtime_root:+:${runtime
 export HF_HOME="${HF_HOME:-${CAMPAIGN_ROOT}/shared-cache/huggingface}"
 # Decoded frames are reproducible scratch, not checkpoints. Keep them node-local
 # to avoid shared-filesystem metadata traffic and output-file explosion.
-FRAME_CACHE_PATH="${FRAME_CACHE_ROOT:-${JOB_CACHE_ROOT}/frames}"
+FRAME_CACHE_PATH="${JOB_CACHE_ROOT}/frames"
+if [[ "${PERSIST_FRAME_CACHE:-0}" == "1" ]]; then
+  FRAME_CACHE_PATH="${FRAME_CACHE_ROOT:-${CAMPAIGN_ROOT}/cache}"
+fi
 mkdir -p "${HF_HOME}" "${FRAME_CACHE_PATH}"
 flags=(--no-compile --no-warm-up --no-fa3)
 [[ "${COMPILE_MODEL:-0}" == "1" ]] && flags=(--compile --warm-up --no-fa3)
