@@ -26,9 +26,13 @@ download "${base}/valid_data/meta_expressions.zip" "${DOWNLOADS}/ref-meta-expres
 download "${base}/train_data/train.zip" "${REF_ROOT}/archives/train.zip" & pids+=("$!")
 download "${base}/train_data/valid.zip" "${REF_ROOT}/archives/valid.zip" & pids+=("$!")
 download "${base}/train_data/test_ytvos.zip" "${REF_ROOT}/archives/test_ytvos.zip" & pids+=("$!")
-download "https://huggingface.co/datasets/CIPLab-Video/decaf-rvos-revos/resolve/main/ReVOS.tar" "${revos_tar}" & pids+=("$!")
+if [[ ! -s "${REVOS_ROOT}/.staged-complete" ]]; then
+  download "https://huggingface.co/datasets/CIPLab-Video/decaf-rvos-revos/resolve/main/ReVOS.tar" "${revos_tar}" & pids+=("$!")
+fi
 for pid in "${pids[@]}"; do wait "${pid}"; done
-unzip -tq "${DOWNLOADS}/ref-meta-expressions.zip" >/dev/null
+for archive in "${DOWNLOADS}/ref-meta-expressions.zip" "${REF_ROOT}/archives/train.zip" "${REF_ROOT}/archives/valid.zip" "${REF_ROOT}/archives/test_ytvos.zip"; do
+  unzip -tq "${archive}" >/dev/null
+done
 unzip -q -o "${DOWNLOADS}/ref-meta-expressions.zip" -d "${REF_ROOT}"
 if [[ ! -s "${REVOS_ROOT}/.staged-complete" ]]; then
   tar -xf "${revos_tar}" -C "${DATA_ROOT}"
