@@ -4,7 +4,11 @@ import json
 import zipfile
 import numpy as np
 from PIL import Image
-from concor_video.datasets import build_refytvos_units, build_revos_units
+from concor_video.datasets import (
+    build_refytvos_units,
+    build_revos_units,
+    sanitize_frame_ids,
+)
 
 
 def _write_ref_split(root, split, videos):
@@ -15,9 +19,17 @@ def _write_ref_split(root, split, videos):
     )
 
 
+def test_hidden_packaging_entries_are_not_frames() -> None:
+    frames, ignored = sanitize_frame_ids(
+        ["00000", ".ipynb_checkpoints", "nested/.cache", "00001"]
+    )
+    assert frames == ["00000", "00001"]
+    assert ignored == [".ipynb_checkpoints", "nested/.cache"]
+
+
 def test_refytvos_public_full_video_and_ground_truth(tmp_path) -> None:
     root = tmp_path / "ref"
-    videos = {"video-a":{"frames":["00000","00001"],"expressions":{"0":{"exp":"an owl on an arm","obj_id":1}}}}
+    videos = {"video-a":{"frames":["00000",".ipynb_checkpoints","00001"],"expressions":{"0":{"exp":"an owl on an arm","obj_id":1}}}}
     _write_ref_split(root, "train", videos)
     (root / "train/Annotations/video-a").mkdir(parents=True)
     (root / "train/JPEGImages/video-a").mkdir(parents=True)

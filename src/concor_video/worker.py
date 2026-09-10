@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkpointing import atomic_json, sample_claim
+from .datasets import sanitize_frame_ids
 from .pipeline import DatasetProvider, build_predictor, process_unit
 
 
@@ -91,6 +92,13 @@ def run_worker(
     cache_root = frame_cache_root or (campaign_root / "cache")
     by_video: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for unit in worklist["units"]:
+        frames, ignored_frames = sanitize_frame_ids(unit.get("frame_ids", []))
+        if ignored_frames:
+            unit["frame_ids"] = frames
+            unit["extraction"].setdefault("notes", []).append(
+                "ignored hidden non-frame metadata entries: "
+                + ", ".join(repr(value) for value in ignored_frames)
+            )
         by_video[_video_key(unit)].append(unit)
     video_batches = sorted(by_video.items())
     if video_batches:

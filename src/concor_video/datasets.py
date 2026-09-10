@@ -6,7 +6,7 @@ import json
 import random
 import re
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 
@@ -65,6 +65,21 @@ def _sample(
     if len(shuffled) < limit:
         raise ValueError(f"requested {limit} examples, but only {len(shuffled)} are available")
     return shuffled[:limit]
+
+
+def sanitize_frame_ids(values: Iterable[Any]) -> tuple[list[str], list[str]]:
+    """Discard hidden packaging entries while preserving ordered frame IDs."""
+
+    frames: list[str] = []
+    ignored: list[str] = []
+    for value in values:
+        frame_id = str(value).strip()
+        parts = PurePosixPath(frame_id).parts
+        if not frame_id or any(part.startswith(".") for part in parts):
+            ignored.append(frame_id)
+        else:
+            frames.append(frame_id)
+    return frames, ignored
 
 
 def _normalize_object_ids(value: Any) -> list[int]:
@@ -180,7 +195,7 @@ def build_refytvos_units(
 
     rows: list[dict[str, Any]] = []
     for video_id, video in videos.items():
-        frames = [str(value) for value in video.get("frames", [])]
+        frames, _ = sanitize_frame_ids(video.get("frames", []))
         if not frames:
             continue
         for expression_id, expression in video.get("expressions", {}).items():
@@ -286,7 +301,7 @@ def build_revos_units(
     videos = _read_json(metadata_path).get("videos", {})
     by_category: dict[str, list[dict[str, Any]]] = {name: [] for name in categories}
     for video_id, video in videos.items():
-        frames = [str(value) for value in video.get("frames", [])]
+        frames, _ = sanitize_frame_ids(video.get("frames", []))
         if not frames:
             continue
         for expression_id, expression in video.get("expressions", {}).items():

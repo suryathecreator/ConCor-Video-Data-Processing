@@ -8,7 +8,7 @@ A single span may link to several tracklets. Overlapping spans are legal, such a
 
 ## Tracking
 
-Work is dynamically claimed by video. A worker materializes frames once, initializes one SAM3.1 Object Multiplex state, and processes every pending instruction for that video. Repeated normalized prompts share one result inside the video batch. Multiplex output discovers several matching instances in one prompt call.
+Work is dynamically claimed by video. A worker materializes frames once, initializes one SAM3.1 Object Multiplex state, and processes every pending instruction for that video. Repeated normalized prompts share one result inside the video batch. Multiplex output discovers several matching instances in one prompt call. Hidden archive-packaging entries such as `.ipynb_checkpoints` are deterministically excluded from frame IDs both when building and when reading a worklist.
 
 Official target sequences are inserted first when public. Ref-YT-VOS public val/test masks are withheld, so SAM3.1 supplies the main tracklet and provenance stays model-generated. ReVOS nonexistent descriptions become zero-tracklet negatives.
 
