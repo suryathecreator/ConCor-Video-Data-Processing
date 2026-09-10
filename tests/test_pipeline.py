@@ -191,11 +191,17 @@ def test_memory_safe_mode_microbatches_and_restores_fast_defaults():
             batched_grounding_batch_size=16, postprocess_batch_size=16
         )
     )
+    predictor.model.max_num_objects = 32
     assert configure_predictor_memory_mode(predictor, enabled=True) == {
         "grounding": 1,
         "postprocess": 1,
+        "objects": 16,
     }
+    assert configure_predictor_memory_mode(
+        predictor, enabled=True, max_num_objects=8
+    )["objects"] == 8
     assert configure_predictor_memory_mode(predictor, enabled=False) == {
         "grounding": 16,
         "postprocess": 16,
+        "objects": 32,
     }

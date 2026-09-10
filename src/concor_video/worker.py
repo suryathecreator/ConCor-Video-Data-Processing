@@ -87,17 +87,35 @@ def _pending(
     # campaign errors lack these fields, so they can recover exactly once after
     # this stronger memory-safe path is deployed.
     error = _error_payload(error_path)
-    used_microbatch = bool(error.get("memory_safe_mode")) and int(
-        error.get("grounding_batch_size", 999)
-    ) <= 1
+    completed_safe_recovery = (
+        bool(error.get("memory_safe_mode"))
+        and int(error.get("grounding_batch_size", 999)) <= 1
+        and int(error.get("max_num_objects", 999)) <= 8
+    )
     safe_oom_retry = (
         _is_cuda_oom(error_path)
         and attempts >= max_error_attempts
-        and not used_microbatch
+        and not completed_safe_recovery
     )
     return attempts == 0 or (
         retry_errors and (attempts < max_error_attempts or safe_oom_retry)
     )
+
+
+def _memory_safe_object_limit(
+    units: list[dict[str, Any]], errors_dir: Path
+) -> int:
+    """Use 16 objects first, then 8 if a microbatched retry still OOMs."""
+
+    for unit in units:
+        error = _error_payload(errors_dir / f"{unit['sample_id']}.json")
+        if (
+            error.get("error_type") == "OutOfMemoryError"
+            and error.get("memory_safe_mode")
+            and int(error.get("grounding_batch_size", 999)) <= 1
+        ):
+            return 8
+    return 16
 
 
 def _claim_name(video_key: str) -> str:
@@ -234,6 +252,10 @@ def run_worker(
                                     "SAM31_MEMORY_SAFE_GROUNDING_BATCH_SIZE", "1"
                                 )
                             ),
+                            max_num_objects=min(
+                                int(os.environ.get("SAM31_MEMORY_SAFE_MAX_OBJECTS", "16")),
+                                _memory_safe_object_limit(pending_units, errors_dir),
+                            ),
                         )
                     shared_frames = None
                     session_id = None
@@ -330,6 +352,9 @@ def run_worker(
                                             "postprocess_batch_size": (
                                                 runtime_batches or {}
                                             ).get("postprocess"),
+                                            "max_num_objects": (
+                                                runtime_batches or {}
+                                            ).get("objects"),
                                             "traceback": traceback.format_exc(),
                                             "failed_at": datetime.now(timezone.utc).isoformat(),
                                         },

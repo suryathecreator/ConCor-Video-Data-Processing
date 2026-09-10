@@ -55,7 +55,11 @@ def _present_frame_count(masks: list[np.ndarray | None]) -> int:
 
 
 def configure_predictor_memory_mode(
-    predictor, *, enabled: bool, grounding_batch_size: int = 1
+    predictor,
+    *,
+    enabled: bool,
+    grounding_batch_size: int = 1,
+    max_num_objects: int = 16,
 ) -> dict[str, int]:
     """Bound SAM3.1 frame batching for a retry without slowing the fast path."""
 
@@ -65,6 +69,7 @@ def configure_predictor_memory_mode(
         defaults = {
             "grounding": int(model.batched_grounding_batch_size),
             "postprocess": int(model.postprocess_batch_size),
+            "objects": int(model.max_num_objects),
         }
         predictor._concor_default_batch_sizes = defaults
     safe_size = max(1, int(grounding_batch_size))
@@ -74,9 +79,13 @@ def configure_predictor_memory_mode(
     model.postprocess_batch_size = (
         1 if enabled else defaults["postprocess"]
     )
+    model.max_num_objects = (
+        max(1, int(max_num_objects)) if enabled else defaults["objects"]
+    )
     return {
         "grounding": int(model.batched_grounding_batch_size),
         "postprocess": int(model.postprocess_batch_size),
+        "objects": int(model.max_num_objects),
     }
 
 
