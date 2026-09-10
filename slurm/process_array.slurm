@@ -27,26 +27,44 @@ mkdir -p "${JOB_CACHE_ROOT}/"{torch,triton,cuda,xdg,pycache}
 cleanup_job_cache() { rm -rf -- "${JOB_CACHE_ROOT}"; }
 trap cleanup_job_cache EXIT
 runtime_root=""
-if [[ -n "${PYTHON_RUNTIME_ARCHIVE:-}" ]] && (( local_stage_ok )); then
+if [[ -n "${PYTHON_RUNTIME_ARCHIVE:-}" ]]; then
   runtime_key="$(stat -c '%s-%Y' "${PYTHON_RUNTIME_ARCHIVE}")"
-  runtime_candidate="${NODE_ASSET_ROOT}/runtime-${runtime_key}"
+  if (( local_stage_ok )); then
+    runtime_candidate="${NODE_ASSET_ROOT}/runtime-${runtime_key}"
+    runtime_lock="${NODE_ASSET_ROOT}/runtime.lock"
+  else
+    # A full node-local /tmp must not silently fall back to the deliberately
+    # minimal driver environment. Materialize the immutable runtime once on
+    # campaign storage and share it under a cross-node flock instead.
+    shared_runtime_root="${CAMPAIGN_ROOT}/shared-cache/python-runtimes"
+    mkdir -p "${shared_runtime_root}"
+    runtime_candidate="${shared_runtime_root}/runtime-${runtime_key}"
+    runtime_lock="${shared_runtime_root}/runtime.lock"
+  fi
   if (
     flock 9
-    if [[ ! -s "${runtime_candidate}/.complete" ]]; then
+    if [[ ! -f "${runtime_candidate}/.complete" ]] || \
+       [[ ! -f "${runtime_candidate}/site-packages/pycocotools/__init__.py" ]]; then
       temp="${runtime_candidate}.part-${SLURM_JOB_ID}-${task_id}"
+      rm -rf -- "${temp}"
       mkdir -p "${temp}"
       if ! tar -xzf "${PYTHON_RUNTIME_ARCHIVE}" -C "${temp}"; then
         rm -rf "${temp}"
         exit 1
       fi
-      touch "${temp}/.complete"
+      [[ -f "${temp}/site-packages/pycocotools/__init__.py" ]] || {
+        echo "[staging] runtime archive lacks pycocotools" >&2
+        rm -rf "${temp}"
+        exit 1
+      }
+      printf '%s\n' "${runtime_key}" > "${temp}/.complete"
       rm -rf "${runtime_candidate}"
       mv "${temp}" "${runtime_candidate}"
     fi
-  ) 9>"${NODE_ASSET_ROOT}/runtime.lock"; then
+  ) 9>"${runtime_lock}"; then
     runtime_root="${runtime_candidate}"
   else
-    echo "[staging] node-local runtime unavailable; using shared Python environment" >&2
+    echo "[staging] packaged runtime unavailable; using shared Python environment" >&2
   fi
 fi
 checkpoint_key="$(stat -c '%s-%Y' "${SAM31_CHECKPOINT}")"

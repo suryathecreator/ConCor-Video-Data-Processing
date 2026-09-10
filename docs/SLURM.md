@@ -25,7 +25,7 @@ Train GPU work additionally waits for the evaluation array and is submitted with
 
 Required settings are SLURM_PARTITION, SLURM_ACCOUNT, and GPU_GRES. One worker requires one GPU. Change gpu:a40:1 to gpu:h200:1, gpu:a100:1, or your site's generic request without code changes. Tune CPU, memory, and time through CPUS_PER_TASK, MEMORY, and TIME_LIMIT. The default host-memory request is 64 GB; the full evaluation campaign peaked at 11.4 GB, leaving substantial headroom while permitting all eight A40s on a 512+ GB node to be scheduled.
 
-PYTHON_RUNTIME_ARCHIVE may point to a tarball whose top level is site-packages/. Jobs unpack it once per node under a lock and prepend it to PYTHONPATH. The SAM checkpoint is likewise copied once per node. This avoids thousands of shared-filesystem imports and repeated 3+ GB checkpoint reads.
+PYTHON_RUNTIME_ARCHIVE may point to a tarball whose top level is site-packages/. Jobs unpack it once per node under a lock and prepend it to PYTHONPATH. A content marker plus a required `pycocotools` tree prevents partial or stale runtime reuse. If node-local storage has less than 5 GiB free, the same immutable runtime is materialized once under the campaign shared cache with a cross-node lock; workers never fall back to an incomplete driver environment. The SAM checkpoint is likewise copied once per node when space allows. This avoids thousands of shared-filesystem imports and repeated 3+ GB checkpoint reads.
 
 ## Resumption
 
