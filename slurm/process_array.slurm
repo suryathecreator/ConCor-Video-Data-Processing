@@ -100,7 +100,7 @@ flags=(--no-compile --no-warm-up --no-fa3)
 [[ "${COMPILE_MODEL:-0}" == "1" ]] && flags=(--compile --warm-up --no-fa3)
 [[ "${USE_FA3:-0}" == "1" ]] && flags+=(--fa3)
 set +e
-"${PYTHON_BIN}" -m concor_video.cli process --worklist "${CAMPAIGN_ROOT}/worklist.json" --campaign-root "${CAMPAIGN_ROOT}" --frame-cache-root "${FRAME_CACHE_PATH}" --checkpoint "${LOCAL_CHECKPOINT}" --shard-index "${task_id}" --shard-count "${SHARD_COUNT}" --max-error-attempts "${MAX_ERROR_ATTEMPTS:-3}" "${flags[@]}"
+"${PYTHON_BIN}" -m concor_video.cli process --worklist "${WORKLIST_PATH:-${CAMPAIGN_ROOT}/worklist.json}" --campaign-root "${CAMPAIGN_ROOT}" --frame-cache-root "${FRAME_CACHE_PATH}" --checkpoint "${LOCAL_CHECKPOINT}" --shard-index "${task_id}" --shard-count "${SHARD_COUNT}" --max-error-attempts "${MAX_ERROR_ATTEMPTS:-3}" "${flags[@]}"
 worker_rc=$?; set -e
 if [[ "${worker_rc}" -eq 99 ]]; then scontrol requeue "${SLURM_JOB_ID}"; exit 0; fi
 exit "${worker_rc}"

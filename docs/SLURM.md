@@ -29,4 +29,4 @@ PYTHON_RUNTIME_ARCHIVE may point to a tarball whose top level is site-packages/.
 
 ## Resumption
 
-The same campaign can be submitted again. Existing records are skipped, stale leases are recovered, and only pending/retryable instructions run. Workers handle USR1 ten minutes before scheduled termination and requeue themselves. Submission IDs are appended to CAMPAIGN_BASE/submissions.txt.
+The same campaign can be submitted again. Existing records are skipped, stale leases are recovered, and only pending/retryable instructions run. `WORKLIST_PATH` may point a worker at a deterministic repair subset while it writes into the same campaign and uses the same claims. Workers handle USR1 ten minutes before scheduled termination and requeue themselves. Submission IDs are appended to CAMPAIGN_BASE/submissions.txt.

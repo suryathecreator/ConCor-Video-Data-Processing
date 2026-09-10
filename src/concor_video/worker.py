@@ -42,13 +42,28 @@ def _video_key(unit: dict[str, Any]) -> str:
     return f"{unit['dataset']}::{unit['split']}::{unit['video_id']}"
 
 
-def _error_attempts(path: Path) -> int:
+def _error_payload(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return 0
+        return {}
     try:
-        return int(json.loads(path.read_text(encoding="utf-8")).get("attempt", 1))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _error_attempts(path: Path) -> int:
+    try:
+        return int(_error_payload(path).get("attempt", 0))
+    except (ValueError, TypeError):
         return 1
+
+
+def _is_cuda_oom(path: Path) -> bool:
+    error = _error_payload(path)
+    return error.get("error_type") == "OutOfMemoryError" and (
+        "CUDA out of memory" in str(error.get("message", ""))
+    )
 
 
 def _pending(
@@ -61,8 +76,14 @@ def _pending(
 ) -> bool:
     if (records_dir / f"{unit['sample_id']}.json").is_file():
         return False
-    attempts = _error_attempts(errors_dir / f"{unit['sample_id']}.json")
-    return attempts == 0 or (retry_errors and attempts < max_error_attempts)
+    error_path = errors_dir / f"{unit['sample_id']}.json"
+    attempts = _error_attempts(error_path)
+    # One final CPU-offloaded retry is bounded separately so campaigns created
+    # before memory-safe mode can recover an already exhausted CUDA OOM.
+    safe_oom_retry = _is_cuda_oom(error_path) and attempts == max_error_attempts
+    return attempts == 0 or (
+        retry_errors and (attempts < max_error_attempts or safe_oom_retry)
+    )
 
 
 def _claim_name(video_key: str) -> str:
@@ -174,6 +195,10 @@ def run_worker(
                     ]
                     if not pending_units:
                         continue
+                    memory_safe_mode = any(
+                        _is_cuda_oom(errors_dir / f"{unit['sample_id']}.json")
+                        for unit in pending_units
+                    )
                     needs_sam = any(_requires_sam(unit) for unit in pending_units)
                     if needs_sam and predictor is None:
                         if not checkpoint.is_file():
@@ -198,14 +223,14 @@ def run_worker(
                                 {
                                     "type": "start_session",
                                     "resource_path": str(shared_frames[0].parent),
-                                    "offload_video_to_cpu": False,
-                                    "offload_state_to_cpu": False,
+                                    "offload_video_to_cpu": memory_safe_mode,
+                                    "offload_state_to_cpu": memory_safe_mode,
                                 }
                             )
                             session_id = response["session_id"]
                         print(
                             f"[video] {video_key} instructions={len(pending_units)} "
-                            f"shared_prompt_cache=on",
+                            f"shared_prompt_cache=on memory_safe={memory_safe_mode}",
                             flush=True,
                         )
                         for unit in pending_units:
