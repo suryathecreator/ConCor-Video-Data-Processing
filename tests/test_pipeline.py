@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 from PIL import Image
 
-from concor_video.pipeline import DatasetProvider, process_unit, temporal_iou
+from concor_video.pipeline import (
+    DatasetProvider,
+    configure_predictor_memory_mode,
+    process_unit,
+    temporal_iou,
+)
 from concor_video.rle import decode_rle, encode_rle
 
 
@@ -176,3 +183,19 @@ def test_rle_and_temporal_iou_round_trip() -> None:
     decoded = decode_rle(encode_rle(mask))
     assert np.array_equal(decoded, mask)
     assert temporal_iou([mask, None], [decoded, None]) == 1.0
+
+
+def test_memory_safe_mode_microbatches_and_restores_fast_defaults():
+    predictor = SimpleNamespace(
+        model=SimpleNamespace(
+            batched_grounding_batch_size=16, postprocess_batch_size=16
+        )
+    )
+    assert configure_predictor_memory_mode(predictor, enabled=True) == {
+        "grounding": 1,
+        "postprocess": 1,
+    }
+    assert configure_predictor_memory_mode(predictor, enabled=False) == {
+        "grounding": 16,
+        "postprocess": 16,
+    }

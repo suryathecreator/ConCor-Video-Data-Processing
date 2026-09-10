@@ -16,7 +16,12 @@ from typing import Any
 
 from .checkpointing import atomic_json, sample_claim
 from .datasets import sanitize_frame_ids
-from .pipeline import DatasetProvider, build_predictor, process_unit
+from .pipeline import (
+    DatasetProvider,
+    build_predictor,
+    configure_predictor_memory_mode,
+    process_unit,
+)
 
 
 STOP_REQUESTED = False
@@ -78,9 +83,18 @@ def _pending(
         return False
     error_path = errors_dir / f"{unit['sample_id']}.json"
     attempts = _error_attempts(error_path)
-    # One final CPU-offloaded retry is bounded separately so campaigns created
-    # before memory-safe mode can recover an already exhausted CUDA OOM.
-    safe_oom_retry = _is_cuda_oom(error_path) and attempts == max_error_attempts
+    # One final microbatched, CPU-offloaded retry is bounded separately. Old
+    # campaign errors lack these fields, so they can recover exactly once after
+    # this stronger memory-safe path is deployed.
+    error = _error_payload(error_path)
+    used_microbatch = bool(error.get("memory_safe_mode")) and int(
+        error.get("grounding_batch_size", 999)
+    ) <= 1
+    safe_oom_retry = (
+        _is_cuda_oom(error_path)
+        and attempts >= max_error_attempts
+        and not used_microbatch
+    )
     return attempts == 0 or (
         retry_errors and (attempts < max_error_attempts or safe_oom_retry)
     )
@@ -210,6 +224,17 @@ def run_worker(
                             warm_up=warm_up,
                             use_fa3=use_fa3,
                         )
+                    runtime_batches = None
+                    if needs_sam:
+                        runtime_batches = configure_predictor_memory_mode(
+                            predictor,
+                            enabled=memory_safe_mode,
+                            grounding_batch_size=int(
+                                os.environ.get(
+                                    "SAM31_MEMORY_SAFE_GROUNDING_BATCH_SIZE", "1"
+                                )
+                            ),
+                        )
                     shared_frames = None
                     session_id = None
                     prompt_cache: dict[str, list[dict[str, Any]]] = {}
@@ -230,7 +255,8 @@ def run_worker(
                             session_id = response["session_id"]
                         print(
                             f"[video] {video_key} instructions={len(pending_units)} "
-                            f"shared_prompt_cache=on memory_safe={memory_safe_mode}",
+                            f"shared_prompt_cache=on memory_safe={memory_safe_mode} "
+                            f"runtime_batches={runtime_batches}",
                             flush=True,
                         )
                         for unit in pending_units:
@@ -297,6 +323,13 @@ def run_worker(
                                             "max_attempts": max_error_attempts,
                                             "error_type": type(error).__name__,
                                             "message": str(error),
+                                            "memory_safe_mode": memory_safe_mode,
+                                            "grounding_batch_size": (
+                                                runtime_batches or {}
+                                            ).get("grounding"),
+                                            "postprocess_batch_size": (
+                                                runtime_batches or {}
+                                            ).get("postprocess"),
                                             "traceback": traceback.format_exc(),
                                             "failed_at": datetime.now(timezone.utc).isoformat(),
                                         },

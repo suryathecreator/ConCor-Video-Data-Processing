@@ -54,6 +54,32 @@ def _present_frame_count(masks: list[np.ndarray | None]) -> int:
     return sum(1 for mask in masks if mask is not None and bool(mask.any()))
 
 
+def configure_predictor_memory_mode(
+    predictor, *, enabled: bool, grounding_batch_size: int = 1
+) -> dict[str, int]:
+    """Bound SAM3.1 frame batching for a retry without slowing the fast path."""
+
+    model = predictor.model
+    defaults = getattr(predictor, "_concor_default_batch_sizes", None)
+    if defaults is None:
+        defaults = {
+            "grounding": int(model.batched_grounding_batch_size),
+            "postprocess": int(model.postprocess_batch_size),
+        }
+        predictor._concor_default_batch_sizes = defaults
+    safe_size = max(1, int(grounding_batch_size))
+    model.batched_grounding_batch_size = (
+        safe_size if enabled else defaults["grounding"]
+    )
+    model.postprocess_batch_size = (
+        1 if enabled else defaults["postprocess"]
+    )
+    return {
+        "grounding": int(model.batched_grounding_batch_size),
+        "postprocess": int(model.postprocess_batch_size),
+    }
+
+
 def install_session_compatibility(predictor):
     """Adapt the current shared base predictor to SAM3.1's init-state signature."""
 
