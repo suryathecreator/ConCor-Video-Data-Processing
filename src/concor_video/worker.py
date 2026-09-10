@@ -189,6 +189,7 @@ def run_worker(
                     session_id = None
                     prompt_cache: dict[str, list[dict[str, Any]]] = {}
                     batch_failed = False
+                    cuda_oom = False
                     try:
                         if needs_sam:
                             reference = next(unit for unit in pending_units if not unit["negative"])
@@ -255,6 +256,9 @@ def run_worker(
                                         flush=True,
                                     )
                                 except Exception as error:
+                                    cuda_oom = type(error).__name__ == "OutOfMemoryError" and (
+                                        "CUDA out of memory" in str(error)
+                                    )
                                     attempt = _error_attempts(error_path) + 1
                                     atomic_json(
                                         error_path,
@@ -287,10 +291,20 @@ def run_worker(
                                 {
                                     "type": "close_session",
                                     "session_id": session_id,
-                                    "run_gc_collect": False,
+                                    "run_gc_collect": batch_failed,
                                 }
                             )
                         provider.finish_video()
+                        if cuda_oom:
+                            # A long-lived worker can fragment an A40 after many
+                            # videos. Drop dead session cycles and return cached
+                            # blocks before the checkpointed retry.
+                            import gc
+                            import torch
+
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     if batch_failed:
                         continue
             if STOP_REQUESTED or (

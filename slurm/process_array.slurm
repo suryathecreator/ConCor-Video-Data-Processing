@@ -86,6 +86,7 @@ else
   echo "[staging] node-local checkpoint unavailable; using shared checkpoint" >&2
 fi
 export XDG_CACHE_HOME="${JOB_CACHE_ROOT}/xdg" TORCHINDUCTOR_CACHE_DIR="${JOB_CACHE_ROOT}/torch" TRITON_CACHE_DIR="${JOB_CACHE_ROOT}/triton" CUDA_CACHE_PATH="${JOB_CACHE_ROOT}/cuda" PYTHONPYCACHEPREFIX="${JOB_CACHE_ROOT}/pycache"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONPATH="${REPO_ROOT}/src:${SAM31_REPO_ROOT}${runtime_root:+:${runtime_root}/site-packages}${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HOME="${HF_HOME:-${CAMPAIGN_ROOT}/shared-cache/huggingface}"
 # Decoded frames are reproducible scratch, not checkpoints. Keep them node-local
