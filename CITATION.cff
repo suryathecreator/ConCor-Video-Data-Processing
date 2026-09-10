@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If this pipeline helps your work, please cite this repository and the upstream BCC, SAM 3, Ref-YouTube-VOS, and ReVOS work."
+title: "ConCor Video Data Processing"
+type: software
+authors:
+  - family-names: "suryathecreator"
+repository-code: "https://github.com/suryathecreator/ConCor-Video-Data-Processing"
+license: MIT
+version: 0.1.0
+date-released: 2026-09-09
