@@ -49,7 +49,7 @@ To stage the public Ref-YT-VOS and ReVOS mirrors resumably:
 bash scripts/prepare_public_datasets.sh /data/concor-video
 ~~~
 
-The script keeps Ref-YT-VOS in validated ZIP archives, extracts ReVOS, and builds a shared read-only SQLite index for its large mask dictionary. Downloads resume after interruption.
+The script keeps Ref-YT-VOS in validated ZIP archives, extracts ReVOS, and builds a shared read-only SQLite index for its large mask dictionary. Large archives use parallel range downloads when aria2 is available, and resume after interruption.
 
 ## Process one split
 
