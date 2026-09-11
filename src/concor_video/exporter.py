@@ -117,28 +117,76 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+class _AtomicParquetSink:
+    """Incrementally build one Parquet file without retaining the campaign."""
+
+    def __init__(
+        self,
+        path: Path,
+        schema: pa.Schema,
+        *,
+        max_batch_rows: int = 64,
+        max_batch_chars: int = 64 * 1024 * 1024,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.temporary = path.with_suffix(path.suffix + f".{os.getpid()}.part")
+        self.schema = schema
+        self.max_batch_rows = max_batch_rows
+        self.max_batch_chars = max_batch_chars
+        self.count = 0
+        self._batch_chars = 0
+        self._batch: list[dict[str, Any]] = []
+        self._writer = pq.ParquetWriter(self.temporary, schema, compression="zstd")
+        self._closed = False
+
+    def append(self, row: dict[str, Any]) -> None:
+        self._batch.append(row)
+        self.count += 1
+        self._batch_chars += sum(
+            len(value) for value in row.values() if isinstance(value, str)
+        )
+        if (
+            len(self._batch) >= self.max_batch_rows
+            or self._batch_chars >= self.max_batch_chars
+        ):
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._batch:
+            return
+        self._writer.write_table(pa.Table.from_pylist(self._batch, schema=self.schema))
+        self._batch.clear()
+        self._batch_chars = 0
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._flush()
+        self._writer.close()
+        self._closed = True
+
+    def commit(self) -> None:
+        self.close()
+        self.temporary.replace(self.path)
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._writer.close()
+            self._closed = True
+        self.temporary.unlink(missing_ok=True)
+
+
 def _atomic_parquet(path: Path, rows: Iterable[dict[str, Any]], schema: pa.Schema) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.part")
-    count = 0
-    writer = pq.ParquetWriter(temporary, schema, compression="zstd")
-    batch: list[dict[str, Any]] = []
+    sink = _AtomicParquetSink(path, schema)
     try:
         for row in rows:
-            batch.append(row)
-            count += 1
-            if len(batch) >= 256:
-                writer.write_table(pa.Table.from_pylist(batch, schema=schema))
-                batch.clear()
-        if batch:
-            writer.write_table(pa.Table.from_pylist(batch, schema=schema))
-        writer.close()
-        temporary.replace(path)
+            sink.append(row)
+        sink.commit()
     except BaseException:
-        writer.close()
-        temporary.unlink(missing_ok=True)
+        sink.abort()
         raise
-    return count
+    return sink.count
 
 
 def _sample_row(record: dict[str, Any]) -> dict[str, Any]:
@@ -272,58 +320,71 @@ def export_campaign(
     worklist = json.loads(worklist_path.read_text(encoding="utf-8"))
     records_dir = campaign_root / "records"
     errors_dir = campaign_root / "errors"
-    records: list[dict[str, Any]] = []
     ledger: list[dict[str, Any]] = []
     dispositions: Counter[str] = Counter()
-    for unit in worklist["units"]:
-        record_path = records_dir / f"{unit['sample_id']}.json"
-        error_path = errors_dir / f"{unit['sample_id']}.json"
-        record = None
-        error = None
-        if record_path.is_file():
-            record = json.loads(record_path.read_text(encoding="utf-8"))
-            validate_record(record)
-            records.append(record)
-            status = "completed"
-            dispositions[record["disposition"]] += 1
-        elif error_path.is_file():
-            error = json.loads(error_path.read_text(encoding="utf-8"))
-            status = "failed"
-        else:
-            status = "pending"
-        ledger.append(
-            {
-                "sample_id": unit["sample_id"],
-                "dataset": unit["dataset"],
-                "split": unit["split"],
-                "cohort": unit["cohort"],
-                "video_id": unit["video_id"],
-                "expression_id": unit["expression_id"],
-                "status": status,
-                "disposition": record["disposition"] if record else "",
-                "target_source_expected": unit["target_source_expected"],
-                "context_prompt_count": len(unit.get("sam_prompt_groups", [])),
-                "tracklet_count": len(record["tracklets"]) if record else 0,
-                "error_type": error.get("error_type", "") if error else "",
-                "error_message": error.get("message", "") if error else "",
-            }
-        )
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    sample_count = _atomic_parquet(
-        output_dir / "samples.parquet",
-        (_sample_row(record) for record in records),
-        SAMPLE_SCHEMA,
-    )
-    verification_count = _atomic_parquet(
-        output_dir / "verification.parquet",
-        (_verification_row(record) for record in records),
-        VERIFICATION_SCHEMA,
-    )
-    tracklet_count = _atomic_parquet(
-        output_dir / "tracklets.parquet", _tracklet_rows(records), TRACKLET_SCHEMA
-    )
-    link_count = _atomic_parquet(output_dir / "links.parquet", _link_rows(records), LINK_SCHEMA)
+    sinks = {
+        "samples": _AtomicParquetSink(output_dir / "samples.parquet", SAMPLE_SCHEMA),
+        "verification": _AtomicParquetSink(
+            output_dir / "verification.parquet", VERIFICATION_SCHEMA
+        ),
+        "tracklets": _AtomicParquetSink(
+            output_dir / "tracklets.parquet", TRACKLET_SCHEMA
+        ),
+        "links": _AtomicParquetSink(output_dir / "links.parquet", LINK_SCHEMA),
+    }
+    try:
+        for unit in worklist["units"]:
+            record_path = records_dir / f"{unit['sample_id']}.json"
+            error_path = errors_dir / f"{unit['sample_id']}.json"
+            record = None
+            error = None
+            if record_path.is_file():
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                validate_record(record)
+                sinks["samples"].append(_sample_row(record))
+                sinks["verification"].append(_verification_row(record))
+                for row in _tracklet_rows((record,)):
+                    sinks["tracklets"].append(row)
+                for row in _link_rows((record,)):
+                    sinks["links"].append(row)
+                status = "completed"
+                dispositions[record["disposition"]] += 1
+            elif error_path.is_file():
+                error = json.loads(error_path.read_text(encoding="utf-8"))
+                status = "failed"
+            else:
+                status = "pending"
+            ledger.append(
+                {
+                    "sample_id": unit["sample_id"],
+                    "dataset": unit["dataset"],
+                    "split": unit["split"],
+                    "cohort": unit["cohort"],
+                    "video_id": unit["video_id"],
+                    "expression_id": unit["expression_id"],
+                    "status": status,
+                    "disposition": record["disposition"] if record else "",
+                    "target_source_expected": unit["target_source_expected"],
+                    "context_prompt_count": len(unit.get("sam_prompt_groups", [])),
+                    "tracklet_count": len(record["tracklets"]) if record else 0,
+                    "error_type": error.get("error_type", "") if error else "",
+                    "error_message": error.get("message", "") if error else "",
+                }
+            )
+        for sink in sinks.values():
+            sink.close()
+        for sink in sinks.values():
+            sink.commit()
+    except BaseException:
+        for sink in sinks.values():
+            sink.abort()
+        raise
+
+    sample_count = sinks["samples"].count
+    verification_count = sinks["verification"].count
+    tracklet_count = sinks["tracklets"].count
+    link_count = sinks["links"].count
 
     ledger_path = output_dir / "run_ledger.csv"
     temporary = ledger_path.with_suffix(f".csv.{os.getpid()}.part")
