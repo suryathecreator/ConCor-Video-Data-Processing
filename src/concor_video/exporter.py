@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import csv
-import json
 import os
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -114,7 +114,7 @@ LINK_SCHEMA = pa.schema(
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return orjson.dumps(value).decode("utf-8")
 
 
 class _AtomicParquetSink:
@@ -317,7 +317,7 @@ def export_campaign(
     campaign_root: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
-    worklist = json.loads(worklist_path.read_text(encoding="utf-8"))
+    worklist = orjson.loads(worklist_path.read_bytes())
     records_dir = campaign_root / "records"
     errors_dir = campaign_root / "errors"
     ledger: list[dict[str, Any]] = []
@@ -340,7 +340,7 @@ def export_campaign(
             record = None
             error = None
             if record_path.is_file():
-                record = json.loads(record_path.read_text(encoding="utf-8"))
+                record = orjson.loads(record_path.read_bytes())
                 validate_record(record)
                 sinks["samples"].append(_sample_row(record))
                 sinks["verification"].append(_verification_row(record))
@@ -351,7 +351,7 @@ def export_campaign(
                 status = "completed"
                 dispositions[record["disposition"]] += 1
             elif error_path.is_file():
-                error = json.loads(error_path.read_text(encoding="utf-8"))
+                error = orjson.loads(error_path.read_bytes())
                 status = "failed"
             else:
                 status = "pending"

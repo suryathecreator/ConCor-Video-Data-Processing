@@ -12,6 +12,7 @@ license = {file = "LICENSE"}
 authors = [{name = "suryathecreator"}]
 dependencies = [
   "numpy>=1.26,<2",
+  "orjson>=3.10",
   "Pillow>=10",
   "pyarrow>=16",
   "spacy>=3.8,<4",

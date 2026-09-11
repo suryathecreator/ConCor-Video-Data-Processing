@@ -24,4 +24,4 @@ Eager SAM execution is the default because measured max-autotune warmup took rou
 
 ## Output
 
-Every selected instruction is represented in run_ledger.csv as completed, failed, or pending. Export validates one checkpoint at a time and streams it into bounded Parquet batches, so memory does not scale with campaign size. All table writers close successfully before their atomic files are committed. verification.parquet is deliberately denormalized so a small offline verifier can load it without table joins.
+Every selected instruction is represented in run_ledger.csv as completed, failed, or pending. Export uses the fast declared `orjson` parser, validates one checkpoint at a time, and streams it into bounded Parquet batches, so memory does not scale with campaign size. All table writers close successfully before their atomic files are committed. verification.parquet is deliberately denormalized so a small offline verifier can load it without table joins.
