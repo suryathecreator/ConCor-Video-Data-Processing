@@ -29,6 +29,18 @@
 <section class="progress-shell">
   <div class="progress-copy"><span id="progressText">Loading...</span><span id="saveState">Local checkpoint ready</span></div>
   <div class="progress-track"><div id="progressBar"></div></div>
+  <details id="videoNavigator" class="video-navigator">
+    <summary>Browse all videos <span id="navigatorCounts">Loading...</span></summary>
+    <div class="video-navigator-panel">
+      <div class="navigator-legend" aria-label="Video decision legend">
+        <span><i class="accepted"></i>Accepted</span>
+        <span><i class="rejected"></i>Rejected</span>
+        <span><i class="undecided"></i>Not decided</span>
+        <span><i class="current"></i>Current</span>
+      </div>
+      <div id="videoGrid" class="video-grid" role="list" aria-label="Jump to a video"></div>
+    </div>
+  </details>
 </section>
 <main>
   <aside>
