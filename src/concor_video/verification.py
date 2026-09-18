@@ -10,6 +10,7 @@ import os
 import threading
 import urllib.parse
 import zipfile
+from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -190,8 +191,13 @@ def _validate_selections(
     if protocol not in (None, SELECTION_PROTOCOL):
         raise ValueError(f"unsupported instruction selection: {protocol}")
     for key, video in decisions.get("videos", {}).items():
+        archived = video.get("accepted_sample_ids", [])
+        if not isinstance(archived, list) or any(not isinstance(item, str) for item in archived):
+            raise ValueError(f"accepted_sample_ids for {key} must be a list of strings")
+        if len(set(archived)) != len(archived) or not set(archived) <= by_video.get(key, set()):
+            raise ValueError(f"{key} has duplicate or foreign accepted sample IDs")
         if "selected_sample_ids" not in video:
-            if protocol == SELECTION_PROTOCOL and video.get("status") == "accepted":
+            if protocol == SELECTION_PROTOCOL and video.get("status") == "accepted" and not archived:
                 raise ValueError(f"accepted video {key} has no confirmed instruction")
             continue
         raw = video["selected_sample_ids"]
@@ -213,30 +219,89 @@ def _validate_selections(
     return selected_by_video
 
 
+def _eligible_ids(rows: list[dict[str, Any]], video: dict[str, Any]) -> list[str]:
+    edits = video.get("instructions", {})
+    return [
+        str(row["sample_id"])
+        for row in rows
+        if not (
+            edits.get(str(row["sample_id"]), {}).get("discarded")
+            or edits.get(str(row["sample_id"]), {}).get("status") == "rejected"
+        )
+    ]
+
+
+def _accepted_ids(
+    rows: list[dict[str, Any]], video: dict[str, Any], selected: dict[str, set[str]], key: str
+) -> list[str]:
+    if video.get("status") != "accepted":
+        return []
+    eligible = set(_eligible_ids(rows, video))
+    if key in selected:
+        accepted = selected[key]
+    elif "accepted_sample_ids" in video:
+        accepted = set(video["accepted_sample_ids"])
+    else:
+        # Legacy video-level acceptance meant every non-discarded instruction.
+        accepted = eligible
+    candidates = accepted & eligible
+    return [sample_id for sample_id in _suggestion_order(rows, key) if sample_id in candidates]
+
+
+def _materialize_sampling(
+    rows: list[dict[str, Any]], decisions: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist the one exported ID and all accepted alternatives without losing edits."""
+
+    prepared = deepcopy(decisions)
+    selected = _validate_selections(rows, prepared)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_video_key(row)].append(row)
+    for key, video in prepared.get("videos", {}).items():
+        if video.get("status") != "accepted":
+            video.pop("sampled_sample_id", None)
+            continue
+        candidates = _accepted_ids(grouped.get(key, []), video, selected, key)
+        if not candidates:
+            video.pop("sampled_sample_id", None)
+            continue
+        eligible = set(_eligible_ids(grouped[key], video))
+        archived = set(video.get("accepted_sample_ids", [])) & eligible
+        if "selected_sample_ids" not in video and "accepted_sample_ids" not in video:
+            archived.update(candidates)
+        archived.update(selected.get(key, set()))
+        video["accepted_sample_ids"] = [
+            sample_id for sample_id in _suggestion_order(grouped[key], key) if sample_id in archived
+        ]
+        video["sampled_sample_id"] = candidates[0]
+    return prepared
+
+
 def apply_decisions(
     rows: list[dict[str, Any]], decisions: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Apply edits deterministically; rejected videos are omitted."""
+    """Export one accepted instruction per video; retain all others in decisions."""
 
     video_decisions = decisions.get("videos", {})
     selected_by_video = _validate_selections(rows, decisions)
-    selection_protocol = decisions.get("selection_protocol") == SELECTION_PROTOCOL
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_video_key(row)].append(row)
+    sampled = {
+        key: accepted[0]
+        for key, video in video_decisions.items()
+        if (accepted := _accepted_ids(grouped.get(key, []), video, selected_by_video, key))
+    }
     output: list[dict[str, Any]] = []
     for source in rows:
         row = dict(source)
         key = _video_key(row)
         video = video_decisions.get(key, {})
         status = video.get("status", "undecided")
-        if status == "rejected":
-            continue
-        if key in selected_by_video:
-            if row["sample_id"] not in selected_by_video[key] or status != "accepted":
-                continue
-        elif selection_protocol:
+        if row["sample_id"] != sampled.get(key):
             continue
         edit = video.get("instructions", {}).get(row["sample_id"], {})
-        if edit.get("discarded") or edit.get("status") == "rejected":
-            continue
         text = str(edit.get("text", row["text"]))
         tracklets = _loads(row["tracklets_json"], [])
         removed = {str(value) for value in edit.get("deleted_tracklet_ids", [])}
@@ -320,7 +385,9 @@ class VerificationState:
         initial = {}
         if decisions_path and decisions_path.is_file():
             initial = json.loads(decisions_path.read_text(encoding="utf-8"))
-        self.decisions = _normalize_decisions(initial, self.fingerprint)
+        self.decisions = _materialize_sampling(
+            self.rows, _normalize_decisions(initial, self.fingerprint)
+        )
         if not self.rows:
             raise ValueError("verification input contains no instructions")
         self._archives: dict[Path, zipfile.ZipFile] = {}
@@ -330,8 +397,9 @@ class VerificationState:
         self._decisions_lock = threading.Lock()
 
     def save_decisions(self, value: dict[str, Any]) -> dict[str, Any]:
-        decisions = _normalize_decisions(value, self.fingerprint)
-        _validate_selections(self.rows, decisions)
+        decisions = _materialize_sampling(
+            self.rows, _normalize_decisions(value, self.fingerprint)
+        )
         decisions["updated_at"] = datetime.now(timezone.utc).isoformat()
         payload = json.dumps(decisions, ensure_ascii=False, indent=2).encode("utf-8")
         with self._decisions_lock:

@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from concor_video.verification import (
     SELECTION_PROTOCOL,
+    VerificationState,
     _candidate_media_sources,
+    _materialize_sampling,
     _suggestion_order,
     apply_decisions,
+    write_verified_parquet,
 )
 
 
@@ -92,8 +97,119 @@ def test_multi_selection_and_legacy_behavior() -> None:
             }
         },
     }
-    assert [row["sample_id"] for row in apply_decisions(rows, selected)] == ["s1", "s2"]
-    assert [row["sample_id"] for row in apply_decisions(rows, {"videos": {}})] == ["s1", "s2", "s3"]
+    output = apply_decisions(rows, selected)
+    assert len(output) == 1
+    assert output[0]["sample_id"] in {"s1", "s2"}
+    assert apply_decisions(rows, {"videos": {}}) == []
+    archived = _materialize_sampling(rows, selected)
+    video = archived["videos"]["revos::val::v1"]
+    assert set(video["accepted_sample_ids"]) == {"s1", "s2"}
+    assert video["selected_sample_ids"] == ["s1", "s2"]
+    assert video["sampled_sample_id"] == output[0]["sample_id"]
+
+
+def test_legacy_acceptance_samples_one_and_archives_other_accepted_instructions() -> None:
+    rows = _selection_rows()
+    original = {
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "instructions": {"s2": {"text": "edited two dogs"}},
+            },
+            "revos::val::v2": {"status": "rejected", "instructions": {}},
+        }
+    }
+    prepared = _materialize_sampling(rows, original)
+    video = prepared["videos"]["revos::val::v1"]
+    assert set(video["accepted_sample_ids"]) == {"s1", "s2"}
+    assert video["sampled_sample_id"] in {"s1", "s2"}
+    assert video["instructions"]["s2"]["text"] == "edited two dogs"
+    assert "accepted_sample_ids" not in original["videos"]["revos::val::v1"]
+    assert [row["sample_id"] for row in apply_decisions(rows, original)] == [
+        video["sampled_sample_id"]
+    ]
+    assert [row["sample_id"] for row in apply_decisions(rows, prepared)] == [
+        video["sampled_sample_id"]
+    ]
+
+
+def test_explicit_override_keeps_legacy_accepted_alternatives_archived() -> None:
+    rows = _selection_rows()
+    original = {
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "accepted_sample_ids": ["s1", "s2"],
+                "selected_sample_ids": ["s2"],
+                "instructions": {},
+            }
+        }
+    }
+    prepared = _materialize_sampling(rows, original)
+    video = prepared["videos"]["revos::val::v1"]
+    assert set(video["accepted_sample_ids"]) == {"s1", "s2"}
+    assert video["sampled_sample_id"] == "s2"
+    assert [row["sample_id"] for row in apply_decisions(rows, prepared)] == ["s2"]
+
+
+def test_legacy_sampling_ignores_discarded_and_rejected_instructions() -> None:
+    decisions = {
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "instructions": {"s1": {"discarded": True}},
+            },
+            "revos::val::v2": {
+                "status": "rejected",
+                "sampled_sample_id": "s3",
+                "instructions": {},
+            },
+        }
+    }
+    prepared = _materialize_sampling(_selection_rows(), decisions)
+    assert prepared["videos"]["revos::val::v1"]["accepted_sample_ids"] == ["s2"]
+    assert prepared["videos"]["revos::val::v1"]["sampled_sample_id"] == "s2"
+    assert "sampled_sample_id" not in prepared["videos"]["revos::val::v2"]
+    assert [row["sample_id"] for row in apply_decisions(_selection_rows(), prepared)] == ["s2"]
+
+
+def test_old_decisions_file_loads_and_saves_all_accepted_alternatives(tmp_path: Path) -> None:
+    rows = [
+        {**row, "expression_id": row["sample_id"], "frame_ids_json": "[]"}
+        for row in _selection_rows()
+    ]
+    parquet = tmp_path / "input.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "concor-video-decisions-v1",
+                "videos": {
+                    "revos::val::v1": {
+                        "status": "accepted",
+                        "instructions": {"s2": {"text": "edited two dogs"}},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = VerificationState([parquet], decisions_path, [], tmp_path / "verified.parquet")
+    restored = state.decisions["videos"]["revos::val::v1"]
+    assert set(restored["accepted_sample_ids"]) == {"s1", "s2"}
+    assert restored["sampled_sample_id"] in {"s1", "s2"}
+    state.save_decisions(state.decisions)
+    persisted = json.loads(decisions_path.read_text(encoding="utf-8"))
+    assert set(persisted["videos"]["revos::val::v1"]["accepted_sample_ids"]) == {
+        "s1", "s2"
+    }
+    assert persisted["videos"]["revos::val::v1"]["instructions"]["s2"]["text"] == "edited two dogs"
+    assert len(apply_decisions(state.rows, persisted)) == 1
+    write_verified_parquet(state.rows, persisted, tmp_path / "verified.parquet")
+    exported = pq.read_table(tmp_path / "verified.parquet").to_pylist()
+    assert len(exported) == 1
+    assert exported[0]["sample_id"] == restored["sampled_sample_id"]
 
 
 @pytest.mark.parametrize(

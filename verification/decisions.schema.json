@@ -50,6 +50,12 @@
             "uniqueItems": true,
             "items": {"type": "string"}
           },
+          "accepted_sample_ids": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string"}
+          },
+          "sampled_sample_id": {"type": "string"},
           "allow_multiple": {"type": "boolean"},
           "instructions": {
             "type": "object",
