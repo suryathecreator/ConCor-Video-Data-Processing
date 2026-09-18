@@ -24,6 +24,7 @@ from .tracklet_schema import rebuild_span_links
 
 
 DECISIONS_VERSION = "concor-video-decisions-v1"
+SELECTION_PROTOCOL = "selected_instructions_v1"
 JSON_COLUMNS = {
     "frame_ids_json",
     "frame_files_json",
@@ -47,6 +48,21 @@ def _dumps(value: Any) -> str:
 
 def _video_key(row: dict[str, Any]) -> str:
     return f"{row['dataset']}::{row['split']}::{row['video_id']}"
+
+
+def _suggestion_order(rows: list[dict[str, Any]], video_key: str) -> list[str]:
+    """Give stable variety while preferring instructions that have tracklets."""
+
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            not (row.get("tracklets_json") not in (None, "", "[]") and not row.get("negative")),
+            hashlib.sha256(
+                (video_key + "\0" + str(row["sample_id"])).encode("utf-8")
+            ).digest(),
+        ),
+    )
+    return [str(row["sample_id"]) for row in ranked]
 
 
 def _candidate_media_sources(
@@ -141,7 +157,7 @@ def _normalize_decisions(value: dict[str, Any], fingerprint: str) -> dict[str, A
     source = value.get("source_fingerprint")
     if source and source != fingerprint:
         raise ValueError("decisions.json belongs to a different input Parquet")
-    return {
+    normalized = {
         "schema_version": DECISIONS_VERSION,
         "source_fingerprint": fingerprint,
         "updated_at": value.get("updated_at"),
@@ -149,6 +165,52 @@ def _normalize_decisions(value: dict[str, Any], fingerprint: str) -> dict[str, A
         "quick_keys_enabled": bool(value.get("quick_keys_enabled", True)),
         "videos": value.get("videos", {}),
     }
+    if "selection_protocol" in value:
+        if value["selection_protocol"] != SELECTION_PROTOCOL:
+            raise ValueError(f"unsupported instruction selection: {value['selection_protocol']}")
+        normalized["selection_protocol"] = SELECTION_PROTOCOL
+    if "suggestion_count" in value:
+        count = value["suggestion_count"]
+        if count not in (1, 3, 5, 10, "all"):
+            raise ValueError("suggestion_count must be 1, 3, 5, 10, or 'all'")
+        normalized["suggestion_count"] = count
+    return normalized
+
+
+def _validate_selections(
+    rows: list[dict[str, Any]], decisions: dict[str, Any]
+) -> dict[str, set[str]]:
+    """Validate per-video selections before filtering any exported rows."""
+
+    by_video: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        by_video[_video_key(row)].add(str(row["sample_id"]))
+    selected_by_video: dict[str, set[str]] = {}
+    protocol = decisions.get("selection_protocol")
+    if protocol not in (None, SELECTION_PROTOCOL):
+        raise ValueError(f"unsupported instruction selection: {protocol}")
+    for key, video in decisions.get("videos", {}).items():
+        if "selected_sample_ids" not in video:
+            if protocol == SELECTION_PROTOCOL and video.get("status") == "accepted":
+                raise ValueError(f"accepted video {key} has no confirmed instruction")
+            continue
+        raw = video["selected_sample_ids"]
+        if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+            raise ValueError(f"selected_sample_ids for {key} must be a list of strings")
+        selected = set(raw)
+        if len(selected) != len(raw) or not selected <= by_video.get(key, set()):
+            raise ValueError(f"{key} has duplicate or foreign selected sample IDs")
+        if len(selected) > 1 and not video.get("allow_multiple", False):
+            raise ValueError(f"{key} selected multiple instructions without multi-select")
+        if video.get("status") == "accepted":
+            if not selected:
+                raise ValueError(f"accepted video {key} has no confirmed instruction")
+            for sample_id in selected:
+                edit = video.get("instructions", {}).get(sample_id, {})
+                if edit.get("discarded") or edit.get("status") == "rejected":
+                    raise ValueError(f"accepted video {key} selected discarded {sample_id}")
+        selected_by_video[key] = selected
+    return selected_by_video
 
 
 def apply_decisions(
@@ -157,12 +219,20 @@ def apply_decisions(
     """Apply edits deterministically; rejected videos are omitted."""
 
     video_decisions = decisions.get("videos", {})
+    selected_by_video = _validate_selections(rows, decisions)
+    selection_protocol = decisions.get("selection_protocol") == SELECTION_PROTOCOL
     output: list[dict[str, Any]] = []
     for source in rows:
         row = dict(source)
-        video = video_decisions.get(_video_key(row), {})
+        key = _video_key(row)
+        video = video_decisions.get(key, {})
         status = video.get("status", "undecided")
         if status == "rejected":
+            continue
+        if key in selected_by_video:
+            if row["sample_id"] not in selected_by_video[key] or status != "accepted":
+                continue
+        elif selection_protocol:
             continue
         edit = video.get("instructions", {}).get(row["sample_id"], {})
         if edit.get("discarded") or edit.get("status") == "rejected":
@@ -261,6 +331,7 @@ class VerificationState:
 
     def save_decisions(self, value: dict[str, Any]) -> dict[str, Any]:
         decisions = _normalize_decisions(value, self.fingerprint)
+        _validate_selections(self.rows, decisions)
         decisions["updated_at"] = datetime.now(timezone.utc).isoformat()
         payload = json.dumps(decisions, ensure_ascii=False, indent=2).encode("utf-8")
         with self._decisions_lock:
@@ -309,6 +380,7 @@ class VerificationState:
             "dataset": rows[0]["dataset"],
             "split": rows[0]["split"],
             "video_id": rows[0]["video_id"],
+            "suggestion_order": _suggestion_order(rows, key),
             "instructions": [_public_row(row) for row in rows],
         }
 

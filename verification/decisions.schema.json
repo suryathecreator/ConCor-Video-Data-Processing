@@ -27,6 +27,12 @@
     "quick_keys_enabled": {
       "type": "boolean"
     },
+    "selection_protocol": {
+      "const": "selected_instructions_v1"
+    },
+    "suggestion_count": {
+      "enum": [1, 3, 5, 10, "all"]
+    },
     "videos": {
       "type": "object",
       "additionalProperties": {
@@ -39,6 +45,12 @@
               "rejected"
             ]
           },
+          "selected_sample_ids": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string"}
+          },
+          "allow_multiple": {"type": "boolean"},
           "instructions": {
             "type": "object",
             "additionalProperties": {

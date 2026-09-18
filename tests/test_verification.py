@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from concor_video.verification import _candidate_media_sources, apply_decisions
+import pytest
+
+from concor_video.verification import (
+    SELECTION_PROTOCOL,
+    _candidate_media_sources,
+    _suggestion_order,
+    apply_decisions,
+)
 
 
 def _row():
@@ -49,3 +56,98 @@ def test_media_root_rebases_processing_host_archive_path(tmp_path: Path) -> None
         "dataset_root": None,
     }
     assert archive in _candidate_media_sources([tmp_path], row)
+
+
+def _selection_rows():
+    first = _row()
+    second = {**_row(), "sample_id": "s2", "text": "two dogs"}
+    third = {**_row(), "sample_id": "s3", "video_id": "v2"}
+    return [first, second, third]
+
+
+def test_new_selection_protocol_exports_only_confirmed_accepted_instruction() -> None:
+    decisions = {
+        "selection_protocol": SELECTION_PROTOCOL,
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "selected_sample_ids": ["s2"],
+                "instructions": {},
+            }
+        },
+    }
+    assert [row["sample_id"] for row in apply_decisions(_selection_rows(), decisions)] == ["s2"]
+
+
+def test_multi_selection_and_legacy_behavior() -> None:
+    rows = _selection_rows()
+    selected = {
+        "selection_protocol": SELECTION_PROTOCOL,
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "allow_multiple": True,
+                "selected_sample_ids": ["s1", "s2"],
+                "instructions": {},
+            }
+        },
+    }
+    assert [row["sample_id"] for row in apply_decisions(rows, selected)] == ["s1", "s2"]
+    assert [row["sample_id"] for row in apply_decisions(rows, {"videos": {}})] == ["s1", "s2", "s3"]
+
+
+@pytest.mark.parametrize(
+    "selection,allow_multiple",
+    [([], False), (["s1", "s2"], False), (["s1", "s1"], True), (["s3"], False)],
+)
+def test_invalid_accepted_selections_are_rejected(selection, allow_multiple) -> None:
+    decisions = {
+        "selection_protocol": SELECTION_PROTOCOL,
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "allow_multiple": allow_multiple,
+                "selected_sample_ids": selection,
+                "instructions": {},
+            }
+        },
+    }
+    with pytest.raises(ValueError):
+        apply_decisions(_selection_rows(), decisions)
+
+
+def test_discarded_selected_instruction_cannot_be_accepted() -> None:
+    decisions = {
+        "selection_protocol": SELECTION_PROTOCOL,
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "selected_sample_ids": ["s1"],
+                "instructions": {"s1": {"discarded": True}},
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="discarded"):
+        apply_decisions(_selection_rows(), decisions)
+
+
+def test_new_protocol_requires_confirmation_even_if_selection_field_is_missing() -> None:
+    decisions = {
+        "selection_protocol": SELECTION_PROTOCOL,
+        "videos": {"revos::val::v1": {"status": "accepted", "instructions": {}}},
+    }
+    with pytest.raises(ValueError, match="no confirmed instruction"):
+        apply_decisions(_selection_rows(), decisions)
+
+
+def test_suggestions_are_stable_and_put_masked_instructions_first() -> None:
+    rows = [
+        {"sample_id": "a", "tracklets_json": "[]", "negative": True},
+        {"sample_id": "b", "tracklets_json": "[{\"tracklet_id\":\"t\"}]", "negative": False},
+        {"sample_id": "c", "tracklets_json": "[{\"tracklet_id\":\"u\"}]", "negative": False},
+        {"sample_id": "d", "tracklets_json": "[]", "negative": False},
+    ]
+    order = _suggestion_order(rows, "revos::val::v1")
+    assert order == _suggestion_order(list(reversed(rows)), "revos::val::v1")
+    assert set(order[:2]) == {"b", "c"}
+    assert set(order) == {"a", "b", "c", "d"}
