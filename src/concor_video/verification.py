@@ -577,6 +577,7 @@ def _handler(state: VerificationState):
                         {
                             "saved_at": decisions["updated_at"],
                             "path": str(state.decisions_path),
+                            "decisions": decisions,
                         }
                     )
                     return
