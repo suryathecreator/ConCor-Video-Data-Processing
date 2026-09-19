@@ -52,12 +52,12 @@
     <div class="decision-row"><button id="acceptButton" class="accept">1 | Accept video</button><button id="rejectButton" class="reject">2 | Reject video</button></div>
     <button id="revertVideoButton" class="quiet wide">Revert entire video</button>
     <div class="viewer"><canvas id="canvas"></canvas><div class="frame-controls"><button id="prevFrame" class="quiet">&larr;</button><input id="frameSlider" type="range" min="0" max="0" value="0"><button id="nextFrame" class="quiet">&rarr;</button><span id="frameLabel"></span></div></div>
-    <div class="legend-note">Preview an instruction to see its tracklets, then confirm which instruction(s) to annotate. Click a colored tracklet name to show or hide it.</div>
+    <div class="legend-note">Preview an instruction to see all of its tracklets. Click a colored text span to isolate its linked mask(s), then confirm which instruction(s) to annotate.</div>
   </aside>
   <section>
     <div class="section-heading"><div><p class="eyebrow">Choose what to annotate</p><h2 id="instructionTitle">Instructions</h2></div><span id="videoStatus" class="status undecided">Undecided</span></div>
     <div class="selection-panel">
-      <div class="selection-heading"><div><h3 id="suggestionTitle">Three suggested instructions</h3><p class="hint">A stable subsample of tracklet-bearing instructions appears first. Preview a target mask, then confirm its instruction to annotate.</p></div><label class="toggle multi-toggle"><input id="allowMultiple" type="checkbox"> Select multiple instructions / target masks for this video</label></div>
+      <div class="selection-heading"><div><h3 id="suggestionTitle">Three suggested instructions</h3><p class="hint">Each full instruction shows all linked text spans. Click a colored span to isolate its mask(s), or preview the instruction to show all of its masks.</p></div><label class="toggle multi-toggle"><input id="allowMultiple" type="checkbox"> Select multiple instructions / target masks for this video</label></div>
       <div id="suggestions" class="chooser-list"></div>
     </div>
     <div class="selected-heading"><h3>Selected for annotation <span id="selectedCount"></span></h3><p id="selectionHint" class="hint">Only confirmed instructions from accepted videos enter the verified Parquet.</p></div>
@@ -66,7 +66,7 @@
   </section>
 </main>
 <template id="choiceTemplate">
-  <article class="choice-card"><div class="choice-top"><div><span class="choice-index"></span><span class="choice-cohort"></span></div><span class="choice-state"></span></div><p class="choice-text"></p><p class="choice-meta"></p><div class="choice-actions"><button type="button" class="preview-choice quiet">Preview mask</button><button type="button" class="confirm-choice">Confirm to annotate</button></div></article>
+  <article class="choice-card"><div class="choice-top"><div><span class="choice-index"></span><span class="choice-cohort"></span></div><span class="choice-state"></span></div><div class="linked-caption choice-linked-caption" aria-label="Full instruction with exact span-to-tracklet links"></div><div class="link-map choice-link-map"></div><p class="choice-meta"></p><div class="choice-actions"><button type="button" class="preview-choice quiet">Preview all masks</button><button type="button" class="confirm-choice">Confirm to annotate</button></div></article>
 </template>
 <template id="instructionTemplate">
   <article class="instruction-card">
