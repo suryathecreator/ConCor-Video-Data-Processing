@@ -8,10 +8,10 @@
 <header>
   <div><p class="eyebrow">ConCor | offline review</p><h1>Video correspondence verification</h1></div>
   <div class="toolbar">
-    <label class="suggestion-setting">Show suggestions per video
+    <label id="suggestionSetting" class="suggestion-setting">Show suggestions per video
       <select id="suggestionCount"><option value="1">1</option><option value="3" selected>3</option><option value="5">5</option><option value="10">10</option><option value="all">All</option></select>
     </label>
-    <label class="toggle"><input id="quickKeys" type="checkbox"> 1/2 quick decisions</label>
+    <label id="quickKeysSetting" class="toggle"><input id="quickKeys" type="checkbox"> 1/2 quick decisions</label>
     <button id="playButton" class="quiet">Play</button>
     <label class="toggle"><input id="loopPlayback" type="checkbox" checked> Loop video</label>
     <details class="save-menu">
@@ -49,28 +49,28 @@
   <aside>
     <div class="nav"><button id="prevButton" class="quiet">&larr; Previous</button><label>Video <input id="videoNumber" type="number" min="1"></label><button id="nextButton" class="quiet">Next &rarr;</button></div>
     <div id="videoMeta" class="meta"></div>
-    <div class="decision-row"><button id="acceptButton" class="accept">1 | Accept video</button><button id="rejectButton" class="reject">2 | Reject video</button></div>
+    <div id="videoDecisionControls" class="decision-row"><button id="acceptButton" class="accept">1 | Accept video</button><button id="rejectButton" class="reject">2 | Reject video</button></div>
     <button id="revertVideoButton" class="quiet wide">Revert entire video</button>
     <div class="viewer"><canvas id="canvas"></canvas><div class="frame-controls"><button id="prevFrame" class="quiet">&larr;</button><input id="frameSlider" type="range" min="0" max="0" value="0"><button id="nextFrame" class="quiet">&rarr;</button><span id="frameLabel"></span></div></div>
-    <div class="legend-note">Preview an instruction to see all of its tracklets. Click a colored text span to isolate its linked mask(s), then confirm which instruction(s) to annotate.</div>
+    <div id="viewerHelp" class="legend-note">Preview an instruction to see all of its tracklets. Click a colored text span to isolate its linked mask(s), then confirm which instruction(s) to annotate.</div>
   </aside>
   <section>
     <div class="section-heading"><div><p class="eyebrow">Choose what to annotate</p><h2 id="instructionTitle">Instructions</h2></div><span id="videoStatus" class="status undecided">Undecided</span></div>
     <div class="selection-panel">
-      <div class="selection-heading"><div><h3 id="suggestionTitle">Three suggested instructions</h3><p class="hint">Each full instruction shows all linked text spans. Click a colored span to isolate its mask(s), or preview the instruction to show all of its masks.</p></div><label class="toggle multi-toggle"><input id="allowMultiple" type="checkbox"> Select multiple instructions / target masks for this video</label></div>
+      <div class="selection-heading"><div><h3 id="suggestionTitle">Three suggested instructions</h3><p id="suggestionHelp" class="hint">Each full instruction shows all linked text spans. Click a colored span to isolate its mask(s), or preview the instruction to show all of its masks.</p></div><label id="multiSetting" class="toggle multi-toggle"><input id="allowMultiple" type="checkbox"> Select multiple instructions / target masks for this video</label></div>
       <div id="suggestions" class="chooser-list"></div>
     </div>
-    <div class="selected-heading"><h3>Selected for annotation <span id="selectedCount"></span></h3><p id="selectionHint" class="hint">Only confirmed instructions from accepted videos enter the verified Parquet.</p></div>
+    <div class="selected-heading"><h3><span id="selectedHeadingTitle">Selected for annotation</span> <span id="selectedCount"></span></h3><p id="selectionHint" class="hint">Only confirmed instructions from accepted videos enter the verified Parquet.</p></div>
     <div id="selectedInstructions"></div>
     <details id="otherInstructions" class="other-instructions" open><summary>Other instructions (select one as an override) <span id="otherCount"></span></summary><div id="otherInstructionList" class="chooser-list"></div></details>
   </section>
 </main>
 <template id="choiceTemplate">
-  <article class="choice-card"><div class="choice-top"><div><span class="choice-index"></span><span class="choice-cohort"></span></div><span class="choice-state"></span></div><div class="linked-caption choice-linked-caption" aria-label="Full instruction with exact span-to-tracklet links"></div><div class="link-map choice-link-map"></div><p class="choice-meta"></p><div class="choice-actions"><button type="button" class="preview-choice quiet">Preview all masks</button><button type="button" class="confirm-choice">Confirm to annotate</button></div></article>
+  <article class="choice-card"><div class="choice-top"><div><span class="choice-index"></span><span class="choice-cohort"></span></div><span class="choice-state"></span></div><div class="linked-caption choice-linked-caption" aria-label="Full instruction with exact span-to-tracklet links"></div><div class="link-map choice-link-map"></div><p class="choice-meta"></p><div class="choice-actions"><button type="button" class="preview-choice quiet">Preview all masks</button><button type="button" class="confirm-choice">Confirm to annotate</button><button type="button" class="revos-accept accept" hidden>Accept instruction</button><button type="button" class="revos-reject reject" hidden>Reject instruction</button></div></article>
 </template>
 <template id="instructionTemplate">
   <article class="instruction-card">
-    <div class="card-head"><div><span class="instruction-index"></span><span class="cohort"></span></div><div class="card-actions"><button class="discard-instruction danger">Discard instruction</button><button class="revert-instruction quiet">Revert instruction</button></div></div>
+    <div class="card-head"><div><span class="instruction-index"></span><span class="cohort"></span></div><div class="card-actions"><button class="revos-accept-editor accept" hidden>Accept instruction</button><button class="revos-reject-editor reject" hidden>Reject instruction</button><button class="discard-instruction danger">Discard instruction</button><button class="revert-instruction quiet">Revert instruction</button></div></div>
     <div class="linked-caption" aria-label="Current exact span-to-tracklet links"></div>
     <div class="link-map"></div>
     <textarea class="caption" rows="3" spellcheck="true"></textarea>

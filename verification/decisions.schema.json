@@ -56,6 +56,14 @@
             "items": {"type": "string"}
           },
           "sampled_sample_id": {"type": "string"},
+          "review_mode": {
+            "const": "revos_preview_v1"
+          },
+          "preview_sample_ids": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string"}
+          },
           "allow_multiple": {"type": "boolean"},
           "instructions": {
             "type": "object",
@@ -67,6 +75,9 @@
                 },
                 "discarded": {
                   "type": "boolean"
+                },
+                "status": {
+                  "enum": ["accepted", "rejected"]
                 },
                 "deleted_tracklet_ids": {
                   "type": "array",

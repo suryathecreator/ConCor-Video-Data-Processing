@@ -8,10 +8,12 @@ import pyarrow.parquet as pq
 import pytest
 
 from concor_video.verification import (
+    REVOS_PREVIEW_PROTOCOL,
     SELECTION_PROTOCOL,
     VerificationState,
     _candidate_media_sources,
     _materialize_sampling,
+    _revos_preview_order,
     _suggestion_order,
     apply_decisions,
     write_verified_parquet,
@@ -267,3 +269,152 @@ def test_suggestions_are_stable_and_put_masked_instructions_first() -> None:
     assert order == _suggestion_order(list(reversed(rows)), "revos::val::v1")
     assert set(order[:2]) == {"b", "c"}
     assert set(order) == {"a", "b", "c", "d"}
+
+
+def _revos_rows() -> list[dict]:
+    rows = []
+    for sample_id, cohort in (
+        ("n1", "nonexistent"),
+        ("n2", "nonexistent"),
+        ("e1", "explicit"),
+        ("e2", "explicit"),
+        ("i1", "implicit"),
+        ("i2", "implicit"),
+    ):
+        negative = cohort == "nonexistent"
+        rows.append(
+            {
+                **_row(),
+                "sample_id": sample_id,
+                "cohort": cohort,
+                "negative": negative,
+                "text": f"{cohort} {sample_id}",
+                "tracklets_json": "[]" if negative else _row()["tracklets_json"],
+                "groups_json": "[]" if negative else _row()["groups_json"],
+            }
+        )
+    return rows
+
+
+def test_revos_preview_is_all_nonexistent_plus_one_explicit_and_implicit() -> None:
+    rows = _revos_rows()
+    preview = _revos_preview_order(rows, "revos::val::v1")
+    cohorts = {row["sample_id"]: row["cohort"] for row in rows}
+    assert {sample_id for sample_id in preview if cohorts[sample_id] == "nonexistent"} == {
+        "n1", "n2"
+    }
+    assert sum(cohorts[sample_id] == "explicit" for sample_id in preview) == 1
+    assert sum(cohorts[sample_id] == "implicit" for sample_id in preview) == 1
+    assert preview == _revos_preview_order(list(reversed(rows)), "revos::val::v1")
+
+
+def test_revos_preview_defaults_to_accepted_and_exports_every_accepted_preview() -> None:
+    rows = _revos_rows()
+    prepared = _materialize_sampling(rows, {"videos": {}})
+    video = prepared["videos"]["revos::val::v1"]
+    assert video["review_mode"] == REVOS_PREVIEW_PROTOCOL
+    assert len(video["preview_sample_ids"]) == 4
+    assert video["accepted_sample_ids"] == video["preview_sample_ids"]
+    assert video["status"] == "accepted"
+    assert all(
+        video["instructions"][sample_id]["status"] == "accepted"
+        for sample_id in video["preview_sample_ids"]
+    )
+    output = apply_decisions(rows, {"videos": {}})
+    assert {row["sample_id"] for row in output} == set(video["preview_sample_ids"])
+    assert all(row["verification_status"] == "accepted" for row in output)
+
+
+def test_revos_per_instruction_rejection_is_preserved_and_filtered() -> None:
+    rows = _revos_rows()
+    initial = _materialize_sampling(rows, {"videos": {}})
+    video = initial["videos"]["revos::val::v1"]
+    rejected = video["preview_sample_ids"][:2]
+    for sample_id in rejected:
+        video["instructions"][sample_id]["status"] = "rejected"
+    prepared = _materialize_sampling(rows, initial)
+    updated = prepared["videos"]["revos::val::v1"]
+    assert not set(rejected) & set(updated["accepted_sample_ids"])
+    assert {row["sample_id"] for row in apply_decisions(rows, prepared)} == set(
+        updated["accepted_sample_ids"]
+    )
+
+
+def test_legacy_revos_rejection_and_edits_upgrade_without_loss() -> None:
+    rows = _revos_rows()
+    decisions = {
+        "videos": {
+            "revos::val::v1": {
+                "status": "rejected",
+                "instructions": {"e1": {"text": "manually edited"}},
+            }
+        }
+    }
+    prepared = _materialize_sampling(rows, decisions)
+    video = prepared["videos"]["revos::val::v1"]
+    assert video["status"] == "rejected"
+    assert video["accepted_sample_ids"] == []
+    assert all(
+        video["instructions"][sample_id]["status"] == "rejected"
+        for sample_id in video["preview_sample_ids"]
+    )
+    assert video["instructions"]["e1"]["text"] == "manually edited"
+    assert apply_decisions(rows, decisions) == []
+
+
+def test_mixed_dataset_keeps_standard_sampling_and_revos_adapter_separate() -> None:
+    revos_rows = _revos_rows()
+    ref_row = {
+        **_row(),
+        "sample_id": "ref-1",
+        "dataset": "refytvos",
+        "video_id": "ref-video",
+        "cohort": "full_video",
+        "negative": False,
+    }
+    decisions = {
+        "selection_protocol": SELECTION_PROTOCOL,
+        "videos": {
+            "refytvos::val::ref-video": {
+                "status": "accepted",
+                "selected_sample_ids": ["ref-1"],
+                "instructions": {},
+            }
+        },
+    }
+    output = apply_decisions([*revos_rows, ref_row], decisions)
+    assert sum(row["dataset"] == "refytvos" for row in output) == 1
+    assert sum(row["dataset"] == "revos" for row in output) == 4
+
+
+def test_old_revos_decisions_file_is_adapted_only_when_saved(tmp_path: Path) -> None:
+    rows = [
+        {
+            **row,
+            "expression_id": row["sample_id"],
+            "frame_ids_json": "[]",
+        }
+        for row in _revos_rows()
+    ]
+    parquet = tmp_path / "revos.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    decisions_path = tmp_path / "decisions.json"
+    old = {
+        "schema_version": "concor-video-decisions-v1",
+        "videos": {
+            "revos::val::v1": {
+                "status": "accepted",
+                "instructions": {"e1": {"text": "old edited expression"}},
+            }
+        },
+    }
+    decisions_path.write_text(json.dumps(old), encoding="utf-8")
+    state = VerificationState([parquet], decisions_path, [], tmp_path / "verified.parquet")
+    assert json.loads(decisions_path.read_text(encoding="utf-8")) == old
+    adapted = state.decisions["videos"]["revos::val::v1"]
+    assert adapted["review_mode"] == REVOS_PREVIEW_PROTOCOL
+    assert adapted["instructions"]["e1"]["text"] == "old edited expression"
+    state.save_decisions(state.decisions)
+    saved = json.loads(decisions_path.read_text(encoding="utf-8"))
+    assert saved["videos"]["revos::val::v1"]["preview_sample_ids"]
+    assert saved["videos"]["revos::val::v1"]["instructions"]["e1"]["text"] == "old edited expression"

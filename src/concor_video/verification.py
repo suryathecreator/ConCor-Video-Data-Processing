@@ -26,6 +26,8 @@ from .tracklet_schema import rebuild_span_links
 
 DECISIONS_VERSION = "concor-video-decisions-v1"
 SELECTION_PROTOCOL = "selected_instructions_v1"
+REVOS_PREVIEW_PROTOCOL = "revos_preview_v1"
+REVOS_COHORTS = {"explicit", "implicit", "nonexistent"}
 JSON_COLUMNS = {
     "frame_ids_json",
     "frame_files_json",
@@ -64,6 +66,41 @@ def _suggestion_order(rows: list[dict[str, Any]], video_key: str) -> list[str]:
         ),
     )
     return [str(row["sample_id"]) for row in ranked]
+
+
+def _is_revos_video(rows: list[dict[str, Any]]) -> bool:
+    return bool(
+        rows
+        and str(rows[0].get("dataset", "")).lower() == "revos"
+        and any(str(row.get("cohort", "")).lower() in REVOS_COHORTS for row in rows)
+    )
+
+
+def _revos_preview_order(rows: list[dict[str, Any]], video_key: str) -> list[str]:
+    """All nonexistent expressions, then one stable explicit and implicit sample."""
+
+    if not _is_revos_video(rows):
+        return []
+    ranked = _suggestion_order(rows, video_key)
+    by_id = {str(row["sample_id"]): row for row in rows}
+    nonexistent = [
+        sample_id
+        for sample_id in ranked
+        if str(by_id[sample_id].get("cohort", "")).lower() == "nonexistent"
+    ]
+    preview = list(nonexistent)
+    for cohort in ("explicit", "implicit"):
+        sample_id = next(
+            (
+                candidate
+                for candidate in ranked
+                if str(by_id[candidate].get("cohort", "")).lower() == cohort
+            ),
+            None,
+        )
+        if sample_id is not None:
+            preview.append(sample_id)
+    return preview
 
 
 def _candidate_media_sources(
@@ -196,6 +233,17 @@ def _validate_selections(
             raise ValueError(f"accepted_sample_ids for {key} must be a list of strings")
         if len(set(archived)) != len(archived) or not set(archived) <= by_video.get(key, set()):
             raise ValueError(f"{key} has duplicate or foreign accepted sample IDs")
+        if video.get("review_mode") == REVOS_PREVIEW_PROTOCOL:
+            preview = video.get("preview_sample_ids", [])
+            if not isinstance(preview, list) or any(not isinstance(item, str) for item in preview):
+                raise ValueError(f"preview_sample_ids for {key} must be a list of strings")
+            if len(set(preview)) != len(preview) or not set(preview) <= by_video.get(key, set()):
+                raise ValueError(f"{key} has duplicate or foreign ReVOS preview IDs")
+            for sample_id in preview:
+                status = video.get("instructions", {}).get(sample_id, {}).get("status")
+                if status not in {"accepted", "rejected"}:
+                    raise ValueError(f"ReVOS preview instruction {sample_id} needs accepted/rejected status")
+            continue
         if "selected_sample_ids" not in video:
             if protocol == SELECTION_PROTOCOL and video.get("status") == "accepted" and not archived:
                 raise ValueError(f"accepted video {key} has no confirmed instruction")
@@ -251,14 +299,45 @@ def _accepted_ids(
 def _materialize_sampling(
     rows: list[dict[str, Any]], decisions: dict[str, Any]
 ) -> dict[str, Any]:
-    """Persist the one exported ID and all accepted alternatives without losing edits."""
+    """Materialize dataset-specific review state without losing legacy edits."""
 
     prepared = deepcopy(decisions)
-    selected = _validate_selections(rows, prepared)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[_video_key(row)].append(row)
-    for key, video in prepared.get("videos", {}).items():
+    videos = prepared.setdefault("videos", {})
+    for key, video_rows in grouped.items():
+        if not _is_revos_video(video_rows):
+            continue
+        video = videos.setdefault(key, {"status": "accepted", "instructions": {}})
+        legacy_status = video.get("status", "accepted")
+        was_adapter = video.get("review_mode") == REVOS_PREVIEW_PROTOCOL
+        preview = _revos_preview_order(video_rows, key)
+        video["review_mode"] = REVOS_PREVIEW_PROTOCOL
+        video["preview_sample_ids"] = preview
+        edits = video.setdefault("instructions", {})
+        for sample_id in preview:
+            edit = edits.setdefault(sample_id, {})
+            if edit.get("status") not in {"accepted", "rejected"}:
+                edit["status"] = (
+                    "rejected"
+                    if edit.get("discarded") or (not was_adapter and legacy_status == "rejected")
+                    else "accepted"
+                )
+        accepted = [
+            sample_id
+            for sample_id in preview
+            if edits[sample_id].get("status") == "accepted"
+            and not edits[sample_id].get("discarded")
+        ]
+        video["accepted_sample_ids"] = accepted
+        video["status"] = "accepted" if accepted else "rejected"
+        video.pop("sampled_sample_id", None)
+
+    selected = _validate_selections(rows, prepared)
+    for key, video in videos.items():
+        if video.get("review_mode") == REVOS_PREVIEW_PROTOCOL:
+            continue
         if video.get("status") != "accepted":
             video.pop("sampled_sample_id", None)
             continue
@@ -281,25 +360,37 @@ def _materialize_sampling(
 def apply_decisions(
     rows: list[dict[str, Any]], decisions: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Export one accepted instruction per video; retain all others in decisions."""
+    """Apply decisions, including the ReVOS multi-instruction preview adapter."""
 
-    video_decisions = decisions.get("videos", {})
-    selected_by_video = _validate_selections(rows, decisions)
+    prepared = _materialize_sampling(rows, decisions)
+    video_decisions = prepared.get("videos", {})
+    selected_by_video = _validate_selections(rows, prepared)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[_video_key(row)].append(row)
-    sampled = {
-        key: accepted[0]
+    export_ids = {
+        key: {accepted[0]}
         for key, video in video_decisions.items()
+        if video.get("review_mode") != REVOS_PREVIEW_PROTOCOL
         if (accepted := _accepted_ids(grouped.get(key, []), video, selected_by_video, key))
     }
+    for key, video in video_decisions.items():
+        if video.get("review_mode") != REVOS_PREVIEW_PROTOCOL:
+            continue
+        edits = video.get("instructions", {})
+        export_ids[key] = {
+            sample_id
+            for sample_id in video.get("preview_sample_ids", [])
+            if edits.get(sample_id, {}).get("status") == "accepted"
+            and not edits.get(sample_id, {}).get("discarded")
+        }
     output: list[dict[str, Any]] = []
     for source in rows:
         row = dict(source)
         key = _video_key(row)
         video = video_decisions.get(key, {})
         status = video.get("status", "undecided")
-        if row["sample_id"] != sampled.get(key):
+        if row["sample_id"] not in export_ids.get(key, set()):
             continue
         edit = video.get("instructions", {}).get(row["sample_id"], {})
         text = str(edit.get("text", row["text"]))
@@ -332,7 +423,7 @@ def apply_decisions(
         row["tracklets_json"] = _dumps(tracklets)
         row["groups_json"] = _dumps(normalized_groups)
         row["span_links_json"] = _dumps(rebuild_span_links(normalized_groups))
-        row["verification_status"] = status
+        row["verification_status"] = str(edit.get("status", status))
         row["verification_decision_json"] = _dumps(edit)
         output.append(row)
     return output
@@ -449,6 +540,8 @@ class VerificationState:
             "split": rows[0]["split"],
             "video_id": rows[0]["video_id"],
             "suggestion_order": _suggestion_order(rows, key),
+            "review_mode": REVOS_PREVIEW_PROTOCOL if _is_revos_video(rows) else None,
+            "preview_order": _revos_preview_order(rows, key),
             "instructions": [_public_row(row) for row in rows],
         }
 
