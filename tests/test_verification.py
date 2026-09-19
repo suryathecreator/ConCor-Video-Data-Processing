@@ -384,7 +384,7 @@ def test_old_revos_preview_extras_are_inferred_as_overrides() -> None:
     assert updated["instructions"][override]["text"] == "saved edit"
 
 
-def test_derived_status_from_first_revos_adapter_is_reset_to_undecided() -> None:
+def test_existing_revos_adapter_status_is_never_reset() -> None:
     rows = _revos_rows()
     prepared = _materialize_sampling(rows, {"videos": {}})
     video = prepared["videos"]["revos::val::v1"]
@@ -392,8 +392,8 @@ def test_derived_status_from_first_revos_adapter_is_reset_to_undecided() -> None
     video.pop("video_decision_explicit")
 
     migrated = _materialize_sampling(rows, prepared)["videos"]["revos::val::v1"]
-    assert migrated["status"] == "undecided"
-    assert migrated["video_decision_explicit"] is False
+    assert migrated["status"] == "accepted"
+    assert migrated["video_decision_explicit"] is True
 
 
 @pytest.mark.parametrize("overrides", [["missing"], ["e1", "e1"]])
@@ -483,5 +483,8 @@ def test_old_revos_decisions_file_is_adapted_only_when_saved(tmp_path: Path) -> 
     assert adapted["instructions"]["e1"]["text"] == "old edited expression"
     state.save_decisions(state.decisions)
     saved = json.loads(decisions_path.read_text(encoding="utf-8"))
+    backups = list(tmp_path.glob("decisions.json.session-start.*.bak"))
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text(encoding="utf-8")) == old
     assert saved["videos"]["revos::val::v1"]["preview_sample_ids"]
     assert saved["videos"]["revos::val::v1"]["instructions"]["e1"]["text"] == "old edited expression"

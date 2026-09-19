@@ -317,16 +317,10 @@ def _materialize_sampling(
         had_decision = key in videos
         video = videos.setdefault(key, {"status": "undecided", "instructions": {}})
         was_adapter = video.get("review_mode") == REVOS_PREVIEW_PROTOCOL
-        if was_adapter and video.get("video_decision_explicit") is not True:
-            # The first adapter release derived video status from instruction count.
-            # Those values were not user video decisions, so migrate them to undecided.
-            video["status"] = "undecided"
-            video["video_decision_explicit"] = False
-        elif not was_adapter and had_decision and video.get("status") in {"accepted", "rejected"}:
-            # A pre-adapter decision came from the original video-level interface.
-            video["video_decision_explicit"] = True
-        else:
-            video.setdefault("video_decision_explicit", False)
+        video.setdefault(
+            "video_decision_explicit",
+            had_decision and video.get("status") in {"accepted", "rejected"},
+        )
         base_preview = _revos_preview_order(video_rows, key)
         base_preview_set = set(base_preview)
         available = {str(row["sample_id"]) for row in video_rows}
@@ -511,8 +505,15 @@ class VerificationState:
             grouped[_video_key(row)].append(row)
         self.videos = sorted(grouped.items())
         initial = {}
+        self._original_decisions_payload: bytes | None = None
+        self.session_backup_path: Path | None = None
         if decisions_path and decisions_path.is_file():
-            initial = json.loads(decisions_path.read_text(encoding="utf-8"))
+            self._original_decisions_payload = decisions_path.read_bytes()
+            initial = json.loads(self._original_decisions_payload.decode("utf-8"))
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            self.session_backup_path = decisions_path.with_name(
+                f"{decisions_path.name}.session-start.{timestamp}.{os.getpid()}.bak"
+            )
         self.decisions = _materialize_sampling(
             self.rows, _normalize_decisions(initial, self.fingerprint)
         )
@@ -532,6 +533,12 @@ class VerificationState:
         payload = json.dumps(decisions, ensure_ascii=False, indent=2).encode("utf-8")
         with self._decisions_lock:
             self.decisions_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._original_decisions_payload is not None and self.session_backup_path:
+                with self.session_backup_path.open("xb") as backup:
+                    backup.write(self._original_decisions_payload)
+                    backup.flush()
+                    os.fsync(backup.fileno())
+                self._original_decisions_payload = None
             temporary = self.decisions_path.with_suffix(
                 self.decisions_path.suffix + f".{os.getpid()}.part"
             )
@@ -551,6 +558,9 @@ class VerificationState:
             "instruction_count": len(self.rows),
             "storage": {
                 "decisions_path": str(self.decisions_path),
+                "session_backup_path": (
+                    str(self.session_backup_path) if self.session_backup_path else None
+                ),
                 "output_path": str(self.output_path),
                 "browser_storage_key": f"concor-video:{self.fingerprint}",
             },
