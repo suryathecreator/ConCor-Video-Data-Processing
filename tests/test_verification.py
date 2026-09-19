@@ -340,6 +340,51 @@ def test_revos_per_instruction_rejection_is_preserved_and_filtered() -> None:
     )
 
 
+def test_revos_override_is_added_to_preview_and_export() -> None:
+    rows = _revos_rows()
+    prepared = _materialize_sampling(rows, {"videos": {}})
+    video = prepared["videos"]["revos::val::v1"]
+    base = set(video["preview_sample_ids"])
+    override = next(row["sample_id"] for row in rows if row["sample_id"] not in base)
+    video["preview_override_sample_ids"] = [override]
+
+    updated = _materialize_sampling(rows, prepared)
+    decision = updated["videos"]["revos::val::v1"]
+    assert decision["preview_override_sample_ids"] == [override]
+    assert decision["preview_sample_ids"][-1] == override
+    assert decision["instructions"][override]["status"] == "accepted"
+    assert override in {row["sample_id"] for row in apply_decisions(rows, updated)}
+
+    decision["instructions"][override]["status"] = "rejected"
+    assert override not in {
+        row["sample_id"] for row in apply_decisions(rows, updated)
+    }
+
+
+def test_old_revos_preview_extras_are_inferred_as_overrides() -> None:
+    rows = _revos_rows()
+    prepared = _materialize_sampling(rows, {"videos": {}})
+    video = prepared["videos"]["revos::val::v1"]
+    base = set(video["preview_sample_ids"])
+    override = next(row["sample_id"] for row in rows if row["sample_id"] not in base)
+    video.pop("preview_override_sample_ids")
+    video["preview_sample_ids"].append(override)
+    video["instructions"][override] = {"status": "accepted", "text": "saved edit"}
+
+    updated = _materialize_sampling(rows, prepared)["videos"]["revos::val::v1"]
+    assert updated["preview_override_sample_ids"] == [override]
+    assert updated["instructions"][override]["text"] == "saved edit"
+
+
+@pytest.mark.parametrize("overrides", [["missing"], ["e1", "e1"]])
+def test_invalid_revos_overrides_are_rejected(overrides) -> None:
+    rows = _revos_rows()
+    prepared = _materialize_sampling(rows, {"videos": {}})
+    prepared["videos"]["revos::val::v1"]["preview_override_sample_ids"] = overrides
+    with pytest.raises(ValueError, match="override IDs"):
+        _materialize_sampling(rows, prepared)
+
+
 def test_legacy_revos_rejection_and_edits_upgrade_without_loss() -> None:
     rows = _revos_rows()
     decisions = {

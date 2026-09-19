@@ -239,6 +239,11 @@ def _validate_selections(
                 raise ValueError(f"preview_sample_ids for {key} must be a list of strings")
             if len(set(preview)) != len(preview) or not set(preview) <= by_video.get(key, set()):
                 raise ValueError(f"{key} has duplicate or foreign ReVOS preview IDs")
+            overrides = video.get("preview_override_sample_ids", [])
+            if not isinstance(overrides, list) or any(not isinstance(item, str) for item in overrides):
+                raise ValueError(f"preview_override_sample_ids for {key} must be strings")
+            if len(set(overrides)) != len(overrides) or not set(overrides) <= set(preview):
+                raise ValueError(f"{key} has invalid ReVOS preview override IDs")
             for sample_id in preview:
                 status = video.get("instructions", {}).get(sample_id, {}).get("status")
                 if status not in {"accepted", "rejected"}:
@@ -312,8 +317,27 @@ def _materialize_sampling(
         video = videos.setdefault(key, {"status": "accepted", "instructions": {}})
         legacy_status = video.get("status", "accepted")
         was_adapter = video.get("review_mode") == REVOS_PREVIEW_PROTOCOL
-        preview = _revos_preview_order(video_rows, key)
+        base_preview = _revos_preview_order(video_rows, key)
+        base_preview_set = set(base_preview)
+        available = {str(row["sample_id"]) for row in video_rows}
+        raw_overrides = video.get("preview_override_sample_ids")
+        if raw_overrides is None and was_adapter:
+            raw_overrides = [
+                sample_id
+                for sample_id in video.get("preview_sample_ids", [])
+                if sample_id not in base_preview_set
+            ]
+        raw_overrides = raw_overrides or []
+        if not isinstance(raw_overrides, list) or any(
+            not isinstance(sample_id, str) for sample_id in raw_overrides
+        ):
+            raise ValueError(f"preview_override_sample_ids for {key} must be strings")
+        if len(set(raw_overrides)) != len(raw_overrides) or not set(raw_overrides) <= available:
+            raise ValueError(f"{key} has duplicate or foreign ReVOS preview override IDs")
+        overrides = [sample_id for sample_id in raw_overrides if sample_id not in base_preview_set]
+        preview = [*base_preview, *overrides]
         video["review_mode"] = REVOS_PREVIEW_PROTOCOL
+        video["preview_override_sample_ids"] = overrides
         video["preview_sample_ids"] = preview
         edits = video.setdefault("instructions", {})
         for sample_id in preview:

@@ -62,11 +62,11 @@
     </div>
     <div class="selected-heading"><h3><span id="selectedHeadingTitle">Selected for annotation</span> <span id="selectedCount"></span></h3><p id="selectionHint" class="hint">Only confirmed instructions from accepted videos enter the verified Parquet.</p></div>
     <div id="selectedInstructions"></div>
-    <details id="otherInstructions" class="other-instructions" open><summary>Other instructions (select one as an override) <span id="otherCount"></span></summary><div id="otherInstructionList" class="chooser-list"></div></details>
+    <details id="otherInstructions" class="other-instructions" open><summary><span id="otherInstructionsLabel">Other instructions (select one as an override)</span> <span id="otherCount"></span></summary><div id="otherInstructionList" class="chooser-list"></div></details>
   </section>
 </main>
 <template id="choiceTemplate">
-  <article class="choice-card"><div class="choice-top"><div><span class="choice-index"></span><span class="choice-cohort"></span></div><span class="choice-state"></span></div><div class="linked-caption choice-linked-caption" aria-label="Full instruction with exact span-to-tracklet links"></div><div class="link-map choice-link-map"></div><p class="choice-meta"></p><div class="choice-actions"><button type="button" class="preview-choice quiet">Preview all masks</button><button type="button" class="confirm-choice">Confirm to annotate</button><button type="button" class="revos-accept accept" hidden>Accept instruction</button><button type="button" class="revos-reject reject" hidden>Reject instruction</button></div></article>
+  <article class="choice-card"><div class="choice-top"><div><span class="choice-index"></span><span class="choice-cohort"></span></div><span class="choice-state"></span></div><div class="linked-caption choice-linked-caption" aria-label="Full instruction with exact span-to-tracklet links"></div><div class="link-map choice-link-map"></div><p class="choice-meta"></p><div class="choice-actions"><button type="button" class="preview-choice quiet">Preview all masks</button><button type="button" class="confirm-choice">Confirm to annotate</button><button type="button" class="revos-add accept" hidden>Add to preview + accept</button><button type="button" class="revos-accept accept" hidden>Accept instruction</button><button type="button" class="revos-reject reject" hidden>Reject instruction</button><button type="button" class="revos-remove quiet" hidden>Remove override</button></div></article>
 </template>
 <template id="instructionTemplate">
   <article class="instruction-card">

@@ -64,6 +64,11 @@
             "uniqueItems": true,
             "items": {"type": "string"}
           },
+          "preview_override_sample_ids": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string"}
+          },
           "allow_multiple": {"type": "boolean"},
           "instructions": {
             "type": "object",
