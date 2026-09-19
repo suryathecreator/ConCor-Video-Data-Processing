@@ -59,6 +59,7 @@
           "review_mode": {
             "const": "revos_preview_v1"
           },
+          "video_decision_explicit": {"type": "boolean"},
           "preview_sample_ids": {
             "type": "array",
             "uniqueItems": true,

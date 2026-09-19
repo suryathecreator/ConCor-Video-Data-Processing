@@ -314,9 +314,19 @@ def _materialize_sampling(
     for key, video_rows in grouped.items():
         if not _is_revos_video(video_rows):
             continue
-        video = videos.setdefault(key, {"status": "accepted", "instructions": {}})
-        legacy_status = video.get("status", "accepted")
+        had_decision = key in videos
+        video = videos.setdefault(key, {"status": "undecided", "instructions": {}})
         was_adapter = video.get("review_mode") == REVOS_PREVIEW_PROTOCOL
+        if was_adapter and video.get("video_decision_explicit") is not True:
+            # The first adapter release derived video status from instruction count.
+            # Those values were not user video decisions, so migrate them to undecided.
+            video["status"] = "undecided"
+            video["video_decision_explicit"] = False
+        elif not was_adapter and had_decision and video.get("status") in {"accepted", "rejected"}:
+            # A pre-adapter decision came from the original video-level interface.
+            video["video_decision_explicit"] = True
+        else:
+            video.setdefault("video_decision_explicit", False)
         base_preview = _revos_preview_order(video_rows, key)
         base_preview_set = set(base_preview)
         available = {str(row["sample_id"]) for row in video_rows}
@@ -345,7 +355,7 @@ def _materialize_sampling(
             if edit.get("status") not in {"accepted", "rejected"}:
                 edit["status"] = (
                     "rejected"
-                    if edit.get("discarded") or (not was_adapter and legacy_status == "rejected")
+                    if edit.get("discarded")
                     else "accepted"
                 )
         accepted = [
@@ -355,7 +365,6 @@ def _materialize_sampling(
             and not edits[sample_id].get("discarded")
         ]
         video["accepted_sample_ids"] = accepted
-        video["status"] = "accepted" if accepted else "rejected"
         video.pop("sampled_sample_id", None)
 
     selected = _validate_selections(rows, prepared)
@@ -402,12 +411,16 @@ def apply_decisions(
         if video.get("review_mode") != REVOS_PREVIEW_PROTOCOL:
             continue
         edits = video.get("instructions", {})
-        export_ids[key] = {
-            sample_id
-            for sample_id in video.get("preview_sample_ids", [])
-            if edits.get(sample_id, {}).get("status") == "accepted"
-            and not edits.get(sample_id, {}).get("discarded")
-        }
+        export_ids[key] = (
+            {
+                sample_id
+                for sample_id in video.get("preview_sample_ids", [])
+                if edits.get(sample_id, {}).get("status") == "accepted"
+                and not edits.get(sample_id, {}).get("discarded")
+            }
+            if video.get("status") == "accepted"
+            else set()
+        )
     output: list[dict[str, Any]] = []
     for source in rows:
         row = dict(source)

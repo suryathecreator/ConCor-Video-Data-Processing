@@ -308,19 +308,23 @@ def test_revos_preview_is_all_nonexistent_plus_one_explicit_and_implicit() -> No
     assert preview == _revos_preview_order(list(reversed(rows)), "revos::val::v1")
 
 
-def test_revos_preview_defaults_to_accepted_and_exports_every_accepted_preview() -> None:
+def test_revos_instructions_default_accepted_but_video_requires_approval() -> None:
     rows = _revos_rows()
     prepared = _materialize_sampling(rows, {"videos": {}})
     video = prepared["videos"]["revos::val::v1"]
     assert video["review_mode"] == REVOS_PREVIEW_PROTOCOL
     assert len(video["preview_sample_ids"]) == 4
     assert video["accepted_sample_ids"] == video["preview_sample_ids"]
-    assert video["status"] == "accepted"
+    assert video["status"] == "undecided"
+    assert video["video_decision_explicit"] is False
     assert all(
         video["instructions"][sample_id]["status"] == "accepted"
         for sample_id in video["preview_sample_ids"]
     )
-    output = apply_decisions(rows, {"videos": {}})
+    assert apply_decisions(rows, prepared) == []
+    video["status"] = "accepted"
+    video["video_decision_explicit"] = True
+    output = apply_decisions(rows, prepared)
     assert {row["sample_id"] for row in output} == set(video["preview_sample_ids"])
     assert all(row["verification_status"] == "accepted" for row in output)
 
@@ -332,6 +336,8 @@ def test_revos_per_instruction_rejection_is_preserved_and_filtered() -> None:
     rejected = video["preview_sample_ids"][:2]
     for sample_id in rejected:
         video["instructions"][sample_id]["status"] = "rejected"
+    video["status"] = "accepted"
+    video["video_decision_explicit"] = True
     prepared = _materialize_sampling(rows, initial)
     updated = prepared["videos"]["revos::val::v1"]
     assert not set(rejected) & set(updated["accepted_sample_ids"])
@@ -347,6 +353,8 @@ def test_revos_override_is_added_to_preview_and_export() -> None:
     base = set(video["preview_sample_ids"])
     override = next(row["sample_id"] for row in rows if row["sample_id"] not in base)
     video["preview_override_sample_ids"] = [override]
+    video["status"] = "accepted"
+    video["video_decision_explicit"] = True
 
     updated = _materialize_sampling(rows, prepared)
     decision = updated["videos"]["revos::val::v1"]
@@ -376,6 +384,18 @@ def test_old_revos_preview_extras_are_inferred_as_overrides() -> None:
     assert updated["instructions"][override]["text"] == "saved edit"
 
 
+def test_derived_status_from_first_revos_adapter_is_reset_to_undecided() -> None:
+    rows = _revos_rows()
+    prepared = _materialize_sampling(rows, {"videos": {}})
+    video = prepared["videos"]["revos::val::v1"]
+    video["status"] = "accepted"
+    video.pop("video_decision_explicit")
+
+    migrated = _materialize_sampling(rows, prepared)["videos"]["revos::val::v1"]
+    assert migrated["status"] == "undecided"
+    assert migrated["video_decision_explicit"] is False
+
+
 @pytest.mark.parametrize("overrides", [["missing"], ["e1", "e1"]])
 def test_invalid_revos_overrides_are_rejected(overrides) -> None:
     rows = _revos_rows()
@@ -398,9 +418,10 @@ def test_legacy_revos_rejection_and_edits_upgrade_without_loss() -> None:
     prepared = _materialize_sampling(rows, decisions)
     video = prepared["videos"]["revos::val::v1"]
     assert video["status"] == "rejected"
-    assert video["accepted_sample_ids"] == []
+    assert video["video_decision_explicit"] is True
+    assert video["accepted_sample_ids"] == video["preview_sample_ids"]
     assert all(
-        video["instructions"][sample_id]["status"] == "rejected"
+        video["instructions"][sample_id]["status"] == "accepted"
         for sample_id in video["preview_sample_ids"]
     )
     assert video["instructions"]["e1"]["text"] == "manually edited"
@@ -424,7 +445,8 @@ def test_mixed_dataset_keeps_standard_sampling_and_revos_adapter_separate() -> N
                 "status": "accepted",
                 "selected_sample_ids": ["ref-1"],
                 "instructions": {},
-            }
+            },
+            "revos::val::v1": {"status": "accepted", "instructions": {}},
         },
     }
     output = apply_decisions([*revos_rows, ref_row], decisions)
