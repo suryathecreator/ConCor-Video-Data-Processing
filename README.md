@@ -97,8 +97,84 @@ For one custom split, use scripts/submit_slurm.sh. Change SLURM_PARTITION, SLURM
 5. Filter tiny/short/low-confidence tracks and merge duplicate temporal tracks by volume IoU.
 6. Validate both tracklet-to-span groups and span-to-tracklet links.
 7. Atomically checkpoint each instruction and export flat tables, a complete ledger, and one verifier-ready Parquet.
+8. **Push the generated data to Hugging Face first.** Then optionally run the API refinement below on a downloaded HF snapshot plus local media. This stage is **optional for generation, required for our higher-quality release**. Inspect its pilot before publishing refined split Parquets.
 
 Nonexistent ReVOS descriptions are preserved as intentional zero-tracklet negatives.
+
+## Optional API refinement after HF upload
+
+[`scripts/refine_hf.py`](scripts/refine_hf.py) reads the [HF annotations](https://huggingface.co/datasets/suryadv/concor-video-data-filtered) and your existing local frames/ZIPs/indexed tar. It uses **`gpt-6-luna`, medium reasoning** for every expression. No SAM rerun or GPU is needed. Downloading this HF repository provides annotations; stage video media separately with the dataset preparation script above.
+
+The [separate prompt](prompts/video_refinement.md) combines the initial-write, audit and rewrite correspondence rules from [ConCor Training Data Generation](https://github.com/suryathecreator/ConCor-Training-Data-Generation) with temporal, coreference and phrase-boundary rules adapted from [Weiyang Huang's VIPOSeg](https://github.com/Weiyang-Huang/VIPOSeg-Grounded-Caption). Its front matter documents the accompanying images, metadata and output contract; **only the body is sent as the prompt**.
+
+Visual presentation follows VIPOSeg: original frame on the left, colored masks and stable numeric labels on the right, up to 540 pixels high, JPEG quality 88. Sampling uses **12 evenly spaced frame indices including both endpoints, plus every tracklet's first visible frame**. It is not 1/2 FPS and does not send every frame. There are no extra crops, inverse crops or visual passes. Full mask sequences remain unchanged in retained output tracklets; sparse visual review cannot certify every intermediate event.
+
+Up to **12 expressions from one dataset/split/video** share their images and tracklet inventory. Only exactly equal complete frame-aligned mask sequences share a visual ID. Each expression keeps its own allowed IDs and intended target, enforced in the response schema and local validation. Groups split above 24 distinct candidate tracks instead of making objects smaller. One severely noisy expression with more than 64 nonempty, distinct tracks is rejected by the configurable cheap filter. Invalid mask sequences, missing main tracks and empty main tracks are also rejected; empty context tracks and exact duplicates are removed. Similar-looking or high-IoU tracks are never merged by this wrapper.
+
+One reasoning call chooses relevant context, repairs missing correspondences, rewrites the caption when needed, or rejects an irreparable sample. Balanced inline tags become exact Unicode character spans locally, then both BCC directions are rebuilt and checked. Every retained positive keeps its intended main track(s). Intentional ReVOS negatives retain their exact original text and no links unless rejected for clear contradictory evidence. Regular mode retries a structurally invalid model result once, using the same evidence and only the affected expressions; this is not a separate audit stage. Persistent validation/API/media failures remain errors, distinct from semantic rejection.
+
+Manual observation from earlier dataset inspection: **Ref-YouTube-VOS more often has problematic context links; ReVOS is generally better but includes severe anomalies.** These observations motivate review; they are not a measured quality ranking. Model refinement and a 20-expression pilot also do not prove the entire release correct.
+
+### Install, download and pilot
+
+From this checkout on Linux/macOS with Python 3.11+:
+
+~~~bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[refine]'
+hf download suryadv/concor-video-data-filtered --repo-type dataset --local-dir data/hf
+
+python scripts/refine_hf.py \
+  --input data/hf --media-root /data/concor-video \
+  --output outputs/luna-pilot --pilot-per-dataset 10 \
+  --mode regular --budget-usd 5
+~~~
+
+The HF root selects `train/verification.parquet` and `eval/unfiltered/verification.parquet`: **50,083 expressions across 5,020 dataset/split videos**. It deliberately excludes the overlapping manually verified subset. A single Parquet or split directory also works. Repeat `--media-root` for multiple locations. The deterministic pilot includes related expressions to exercise shared inputs and a nonexistent example when available.
+
+The script asks for the API key with hidden terminal input. It keeps the key in process memory, clears its session credential on exit and never writes it to checkpoints, command lines or logs. For automation it can consume `OPENAI_API_KEY` from the environment; remove any parent-shell copy yourself. Deleting a local copy does not revoke a key or erase a previously sent chat message. Resume with the same command and output directory; completed API responses are reused. Do not change the input or prompt within an existing run.
+
+### Full run, budget and outputs
+
+Prepare inputs and inspect the conservative reservation before submitting:
+
+~~~bash
+python scripts/refine_hf.py \
+  --input data/hf --media-root /data/concor-video \
+  --output outputs/luna-full --mode prepare --budget-usd 95
+
+python scripts/refine_hf.py \
+  --input data/hf --media-root /data/concor-video \
+  --output outputs/luna-full --mode batch --budget-usd 95 --wait
+~~~
+
+The $5 pilot allowance plus $95 full-run allowance keeps the two runs within the **$100 API budget**. Each output directory has a durable reservation ledger. Pending/uncertain charges continue counting against it. A preflight above the allowance sends no requests; reaching the limit preserves pending work, never labels it bad data. A reservation is conservative, not an OpenAI account spending limit: keep prices current and do not bypass the ledger by copying runs. After a submission/network interruption, collect known batches before investigating unresolved reservations; the script refuses to blindly repeat potentially billed calls.
+
+Pricing checked 2026-10-07: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) costs $0.10 input / $0.50 output per million standard tokens ($0.125 cache writes; $0.01 cache hits); [Batch](https://developers.openai.com/api/docs/guides/batch) halves those rates and has a 24-hour completion window. The ledger includes reasoning output, reserves the output ceiling, assumes no cache hits, accounts for cache writes and long-context premiums, and settles from returned usage. Image billing estimates deliberately overestimate patch tokens. Input rendering time and your account's Batch queue limit also affect ETA; multiple queue waves can take longer than 24 hours. Shared evidence reduces cost without lowering the requested model or visual resolution.
+
+To resume Batch collection without preparing frames again:
+
+~~~bash
+python scripts/refine_hf.py --input data/hf --output outputs/luna-full \
+  --mode collect --budget-usd 95 --wait
+~~~
+
+Batch files stay below 180 MB and a conservative 16-million-input-token bound. `--wait` submits and collects one wave at a time; without it, `--mode batch` submits one wave, then a later `collect` downloads its results. Run `batch` again to submit remaining waves. Do not switch a run between regular and Batch billing modes. Check your account's actual queue allowance before a full run.
+
+Outputs are **`train.parquet`, `val.parquet`, `test.parquet`** as applicable, with the **same column order, Arrow types and schema metadata as the input**. Dataset identity remains in each row. Kept/rewritten rows retain `sample_id`, frame lists, full retained mask sequences and original extraction/SAM provenance; only `text`, `tracklets_json`, `groups_json`, `span_links_json` and `disposition` can change. Rejected rows are omitted. Empty splits still have the original schema. Check `summary.json` for `complete: true` before publishing: error/pending rows are omitted from partial exports, with their status retained in `audit.json`. Per-request manifests, raw model responses and decisions are local sidecars, not extra HF columns. No command uploads refined annotations to HF automatically.
+
+### Inspect the pilot in a browser
+
+~~~bash
+python scripts/build_refinement_viewer.py --input data/hf \
+  --run outputs/luna-pilot --output outputs/pilot-viewer
+python -m http.server 8000 --directory outputs/pilot-viewer
+~~~
+
+The static viewer includes exact shared input images, original/refined spans, retained IDs, rejection reasons and split Parquet downloads. It can be hosted without an API key. Dataset media keeps its upstream terms; do not commit generated pilot assets to the source branch.
+
+Pilot completed **2026-10-07** with seed `20261007`: 10 Ref-YouTube-VOS and 10 ReVOS expressions, 10 shared initial requests and one validation retry. Results: **11 rewrites, 4 keeps, 5 rejections, 0 unresolved errors**; `train.parquet` has 9 retained rows and `val.parquet` has 6, both with the exact source schema. Usage was 211,515 input and 10,114 output tokens, costing approximately **$0.02981** including the retry. Scaling the observed cost per expression to 50,083 expressions at Batch prices gives **about $37**, before any further sharing benefit from larger groups. This small-pilot projection is not a quote; the full workload's preflight and $95 ledger allowance govern submission. The pilot verifies the workflow and surfaces examples for inspection, not a corpus-level quality score.
 
 ## Offline verification
 

@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+refine = ["requests>=2.32", "opencv-python-headless>=4.9,<4.12", "huggingface_hub>=0.34"]
 
 [project.scripts]
 concor-video = "concor_video.cli:main"
