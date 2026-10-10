@@ -224,3 +224,177 @@ def test_terminal_batch_without_results_is_error_not_semantic_rejection(tmp_path
     result = json.loads((tmp_path / "decisions" / (refine.digest("a") + ".json")).read_text())
     assert result["decision"] == "error" and ledger.total() == .1
     ledger.db.close()
+
+
+def test_facing_is_not_an_entity_even_if_model_emits_it():
+    with pytest.raises(ValueError, match="verb-only"):
+        refine.parse_tags("a penguin [1]facing[/1] it", {1})
+
+
+def test_nlp_preserves_words_and_all_candidates_for_valid_noun(tmp_path):
+    original = row()
+    original["text"] = "a dog facing a dog"
+    groups = json.loads(original["groups_json"])
+    groups[1]["text_spans"] = [{"start": 13, "end": 18, "text": "a dog"}]
+    duplicate = deepcopy(groups[1])
+    duplicate.update(group_id="ctx2", tracklet_ids=["context2"])
+    verb = {"group_id": "verb", "role": "context_entity", "identity": "face",
+            "tracklet_ids": ["face"], "text_spans": [{"start": 6, "end": 12, "text": "facing"}]}
+    original["groups_json"] = refine.dumps(groups + [duplicate, verb])
+    tracks = json.loads(original["tracklets_json"])
+    tracks += [{"tracklet_id": "context2", "masks": [{"size": [2, 2], "counts": [2, 1, 1]}, None]},
+               {"tracklet_id": "face", "masks": [{"size": [2, 2], "counts": [3, 1]}, None]}]
+    original["tracklets_json"] = refine.dumps(tracks)
+    source = SimpleNamespace(row=lambda _: original)
+    packets, early = refine.prepare_nlp(source, ["a"], SimpleNamespace(max_tracklets=64, group_size=12), "prompt", tmp_path)
+    assert not early
+    manifest = packets[0]
+    entry = manifest["packet"]["expressions"][0]
+    assert len(entry["existing_groups"]) == 3
+    assert entry["existing_groups"][1]["candidate_count"] == 2
+    result = {"decision": "rewrite", "tagged_caption": "[1]a dog[/1] facing [2]a dog[/2]"}
+    clean = refine.apply_result(original, result, manifest["mapping"]["a"])
+    assert clean["text"] == original["text"]
+    assert json.loads(clean["tracklets_json"]) == tracks[:3]
+    assert "face" not in {t for g in json.loads(clean["groups_json"]) for t in g["tracklet_ids"]}
+    assert json.loads(clean["groups_json"])[1]["text_spans"] == [{"start": 13, "end": 18, "text": "a dog"}]
+    with pytest.raises(ValueError, match="exact original"):
+        refine.apply_result(original, {"decision": "rewrite", "tagged_caption": "[1]A dog[/1]"}, manifest["mapping"]["a"])
+    with pytest.raises(ValueError, match="main referent"):
+        refine.apply_result(original, {"decision": "rewrite", "tagged_caption": "a dog facing [2]a dog[/2]"}, manifest["mapping"]["a"])
+    with pytest.raises(ValueError, match="cannot semantically reject"):
+        refine.apply_result(original, {"decision": "reject", "tagged_caption": ""}, manifest["mapping"]["a"])
+    assert not manifest["images"]
+    assert refine.response_schema(manifest)["properties"]["results"]["items"]["anyOf"][0]["properties"]["decision"]["enum"] == ["keep", "rewrite"]
+
+
+def test_nlp_negative_has_no_candidate_groups(tmp_path):
+    original = row()
+    original["negative"] = True
+    original["text"] = "a dog [that is absent]"
+    packets, _ = refine.prepare_nlp(SimpleNamespace(row=lambda _: original), ["a"],
+                                   SimpleNamespace(max_tracklets=64, group_size=12), "prompt", tmp_path)
+    clean = refine.apply_result(original, {"decision": "keep", "tagged_caption": original["text"]}, packets[0]["mapping"]["a"])
+    assert clean["text"] == original["text"] and clean["groups_json"] == clean["tracklets_json"] == "[]"
+
+
+def test_density_sample_has_exact_video_quotas_and_featured_within_200(monkeypatch):
+    import sys
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    from refine_sample import select_videos
+    values = {}
+    for dataset in ["ref_youtube_vos", "revos"]:
+        for index in range(120):
+            original = row(f"{dataset}-{index}")
+            original.update(dataset=dataset, video_id=f"{dataset}-{index}")
+            count = [1, 4, 8, 20][index % 4]
+            original["groups_json"] = refine.dumps([{"tracklet_ids": [str(i) for i in range(count)]}])
+            values[original["sample_id"]] = original
+            second = dict(original, sample_id=original["sample_id"] + "-second", groups_json="[]")
+            values[second["sample_id"]] = second
+    source = SimpleNamespace(rows=values)
+    ids, records = select_videos(source, 100, 123, ["ref_youtube_vos-3"])
+    assert len(ids) == len(records) == len(set(ids)) == 200
+    assert records[0]["featured"] and records[0]["video_id"] == "ref_youtube_vos-3"
+    from collections import Counter
+    assert set(Counter((r["dataset"], r["density_bin"]) for r in records).values()) == {25}
+    assert (ids, records) == select_videos(source, 100, 123, ["ref_youtube_vos-3"])
+    with pytest.raises(ValueError, match="never a full-corpus"):
+        select_videos(source, 101, 123, [])
+    with pytest.raises(ValueError, match="missing"):
+        select_videos(source, 100, 123, ["missing"])
+
+
+def test_parallel_calls_checkpoint_successful_siblings_after_failure(tmp_path):
+    packets = [{"request_id": sid, "mapping": {sid: MAPPING}, "max_output_tokens": 100,
+                "packet": {"frame_ids": [], "selected_frame_indices": [], "expressions": [
+                    {"sample_id": sid, "allowed_ids": [1, 2], "negative": False}]}, "dimensions": [], "images": []}
+               for sid in ["a", "b"]]
+    def call(*args, **kwargs):
+        sid = json.loads(kwargs["json"]["input"][0]["content"][-1]["text"])["expressions"][0]["sample_id"]
+        if sid == "a":
+            import time
+            deadline = time.monotonic() + 5
+            checkpoint = tmp_path / "packets/b/response.json"
+            while not checkpoint.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert checkpoint.exists(), "completed peer must checkpoint while the first request is still running"
+            raise RuntimeError("network failed")
+        return SimpleNamespace(json=lambda: {"status": "completed", "usage": {"input_tokens": 5, "output_tokens": 5},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": refine.dumps({"results": [
+                {"sample_id": sid, "decision": "rewrite", "tagged_caption": "[1]A dog[/1] runs."}]})}]}]})
+    ledger = refine.Ledger(tmp_path / "budget.sqlite", 1)
+    with pytest.raises(RuntimeError, match="network"):
+        refine.run_regular(packets, "prompt", SimpleNamespace(row=row), tmp_path, ledger, SimpleNamespace(call=call), workers=2)
+    assert (tmp_path / "packets/b/response.json").exists()
+    assert dict(ledger.db.execute("SELECT id,state FROM charges")) == {"a": "reserved", "b": "completed"}
+    ledger.db.close()
+
+
+def test_media_eligibility_does_not_treat_empty_root_as_video(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    from refine_sample import available_rows
+    rows = {sid: dict(row(sid), frame_source=str(tmp_path / archive), dataset_root=str(tmp_path), video_id=sid)
+            for sid, archive in [("present", "train.zip"), ("missing", "valid.zip"), ("folder", "missing.zip")]}
+    (tmp_path / "train.zip").write_bytes(b"fixture: eligibility checks source existence only")
+    (tmp_path / "JPEGImages/folder").mkdir(parents=True)
+    assert set(available_rows(SimpleNamespace(rows=rows), [tmp_path])) == {"present", "folder"}
+
+
+def test_stable_visual_ids_survive_nlp_removal(tmp_path, monkeypatch):
+    original = row()
+    sig = refine.track_signature(json.loads(original['frame_ids_json']), json.loads(original['tracklets_json'])[0])
+    source = SimpleNamespace(rows={'a': original}, row=lambda _: original, visual_registry=lambda _: {"dropped": 1, sig: 2})
+    args = SimpleNamespace(media_root=[], max_tracklets=64, group_size=12, group_tracklets=24, sample_count=12)
+    monkeypatch.setattr(refine.Media, 'frame', lambda *args: b'fixture')
+    monkeypatch.setattr(refine, 'render_pair', lambda *args: (b'jpeg-fixture', [4, 2]))
+    packets, _ = refine.prepare(source, ['a'], args, 'prompt', tmp_path)
+    assert packets[0]['mapping']['a']['visual_to_local'] == {2: 'target', 3: 'context'}
+
+
+def recovery_packet():
+    return {"request_id": "interrupted", "mapping": {"a": MAPPING}, "max_output_tokens": 100,
+            "packet": {"frame_ids": [], "selected_frame_indices": [], "expressions": [
+                {"sample_id": "a", "allowed_ids": [1, 2], "negative": False}]}, "dimensions": [], "images": []}
+
+
+def test_explicit_interruption_recovery_keeps_old_charge_and_resumes_once(tmp_path):
+    packet = recovery_packet()
+    refine.atomic_json(tmp_path / "requests.json", [packet["request_id"]])
+    ledger = refine.Ledger(tmp_path / "budget.sqlite", 1)
+    ledger.reserve("interrupted", .1)
+    calls = []
+    def call(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(json=lambda: {"status": "completed", "usage": {"input_tokens": 5, "output_tokens": 5},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": refine.dumps({"results": [
+                {"sample_id": "a", "decision": "rewrite", "tagged_caption": "[1]A dog[/1] runs."}]})}]}]})
+    client = SimpleNamespace(call=call)
+    with pytest.raises(RuntimeError, match="unresolved"):
+        refine.run_regular([packet], "prompt", SimpleNamespace(row=row), tmp_path, ledger, client)
+    assert not calls
+    refine.run_regular([packet], "prompt", SimpleNamespace(row=row), tmp_path, ledger, client, recover_interrupted=True)
+    assert len(calls) == 1 and ledger.total() > .1
+    assert ledger.db.execute("SELECT amount,state FROM charges WHERE id='interrupted'").fetchone() == (.1, "reserved")
+    decision = json.loads((tmp_path / "decisions" / (refine.digest("a") + ".json")).read_text())
+    assert decision["transport_retry_of"] == "interrupted" and decision["decision"] == "rewrite"
+    total = ledger.total()
+    refine.run_regular([packet], "prompt", SimpleNamespace(row=row), tmp_path, ledger, client, recover_interrupted=True)
+    assert len(calls) == 1 and ledger.total() == total
+    ledger.db.close()
+
+
+@pytest.mark.parametrize("limit,already_interrupted,reason", [(0.1, False, "budget"), (1, True, "no further")])
+def test_interruption_recovery_never_bypasses_budget_or_retries_forever(tmp_path, limit, already_interrupted, reason):
+    packet = recovery_packet()
+    refine.atomic_json(tmp_path / "requests.json", [packet["request_id"]])
+    ledger = refine.Ledger(tmp_path / "budget.sqlite", limit)
+    ledger.reserve("interrupted", .1)
+    if already_interrupted:
+        ledger.reserve(refine.digest(["interrupted", "transport-recovery-v1"])[:24], .1)
+    def call(*args, **kwargs):
+        pytest.fail("No HTTP call is allowed")
+    with pytest.raises(RuntimeError, match=reason):
+        refine.run_regular([packet], "prompt", SimpleNamespace(row=row), tmp_path, ledger, SimpleNamespace(call=call), recover_interrupted=True)
+    assert ledger.total() == (.2 if already_interrupted else .1)
+    ledger.db.close()

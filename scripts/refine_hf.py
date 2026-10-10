@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 from copy import deepcopy
+import gc
 import getpass
 import hashlib
 import json
@@ -105,7 +107,7 @@ def discover_inputs(path):
 
 class Source:
     """Small metadata index; masks are loaded from only the required row groups."""
-    def __init__(self, paths):
+    def __init__(self, paths, include_media=False):
         self.paths = paths
         self.files = [pq.ParquetFile(p) for p in paths]
         self.schema = self.files[0].schema_arrow
@@ -117,7 +119,8 @@ class Source:
             if missing:
                 raise ValueError(f"missing columns: {sorted(missing)}")
             for group_index in range(parquet.num_row_groups):
-                for offset, row in enumerate(parquet.read_row_group(group_index, columns=META).to_pylist()):
+                columns = META + ([c for c in ("frame_source", "dataset_root") if c in self.schema.names] if include_media else [])
+                for offset, row in enumerate(parquet.read_row_group(group_index, columns=columns).to_pylist()):
                     sid = row["sample_id"]
                     if sid in self.rows:
                         raise ValueError(f"duplicate sample_id {sid}; do not combine raw and verified copies")
@@ -131,6 +134,18 @@ class Source:
     def row(self, sid):
         file_index, group_index, offset = self.locations[sid]
         return self.row_group(file_index, group_index)[offset]
+
+
+def release_memory():
+    """Return large temporary Arrow/RLE/render buffers on constrained shared hosts."""
+    Source.row_group.cache_clear()
+    gc.collect()
+    pa.default_memory_pool().release_unused()
+    if sys.platform.startswith("linux"):
+        try:
+            ctypes.CDLL(None).malloc_trim(0)
+        except (AttributeError, OSError):
+            pass
 
 
 def video_key(row):
@@ -349,6 +364,8 @@ def parse_tags(tagged, allowed):
         raise ValueError("unbalanced tags, unsupported annotation markup, or empty/outer-spaced caption")
     for spans in mentions.values():
         for start, end in spans:
+            if text[start:end].casefold() == "facing":
+                raise ValueError("verb-only link: facing cannot be an entity span")
             if text[start:end] != text[start:end].strip():
                 raise ValueError("span contains surrounding whitespace")
             if start and text[start - 1].isalnum() and text[start].isalnum():
@@ -359,6 +376,8 @@ def parse_tags(tagged, allowed):
 
 
 def apply_result(row, result, mapping):
+    if "nlp_groups" in mapping:
+        return apply_nlp_result(row, result, mapping)
     if result["decision"] == "reject":
         if result["tagged_caption"]:
             raise ValueError("rejected result must have empty caption")
@@ -400,6 +419,79 @@ def apply_result(row, result, mapping):
     return output
 
 
+def apply_nlp_result(row, result, mapping):
+    """Repair language links without choosing among an entity's mask candidates."""
+    if result["decision"] not in {"keep", "rewrite"}:
+        raise ValueError("text-only cleanup cannot semantically reject an example")
+    if row["negative"]:
+        if result["decision"] != "keep" or result["tagged_caption"] != row["text"]:
+            raise ValueError("NLP cleanup must preserve intentional negatives without links")
+        output = dict(row)
+        output.update(groups_json="[]", span_links_json="[]", tracklets_json="[]")
+        return output
+    groups_by_id = {int(k): v for k, v in mapping["nlp_groups"].items()}
+    text, mentions = parse_tags(result["tagged_caption"], set(groups_by_id))
+    if text != row["text"]:
+        raise ValueError("NLP cleanup must preserve the exact original text")
+    if not set(mapping["main_ids"]).issubset(mentions):
+        raise ValueError("NLP cleanup dropped the intended main referent")
+    groups = []
+    for gid, spans in sorted(mentions.items()):
+        group = deepcopy(groups_by_id[gid])
+        group["text_spans"] = [{"start": a, "end": b, "text": text[a:b]} for a, b in sorted(spans)]
+        groups.append(group)
+    retained_ids = {tid for g in groups for tid in g["tracklet_ids"]}
+    output = dict(row)
+    output.update(groups_json=dumps(groups), span_links_json=dumps(rebuild_span_links(groups)),
+                  tracklets_json=dumps([t for t in loads(row["tracklets_json"], []) if t["tracklet_id"] in retained_ids]))
+    # This is an intermediate linguistic audit, not a complete/visually verified BCC.
+    return output
+
+
+def prepare_nlp(source, ids, args, prompt, output):
+    """Text-only packets merge identical linguistic groups, never mask instances."""
+    packets, early, entries, mappings = [], {}, [], {}
+    for sid in ids:
+        row = source.row(sid)
+        inspection, reason = inspect_row(row, args.max_tracklets)
+        if reason:
+            early[sid] = {"sample_id": sid, "decision": "reject", "tagged_caption": "",
+                          "reason_codes": [reason], "stage": "heuristic"}
+            continue
+        kept, aliases = inspection
+        allowed = {t["tracklet_id"] for t in kept}
+        merged = {}
+        if not row["negative"]:
+            for group in loads(row["groups_json"], []):
+                tids = {aliases.get(t, t) for t in group.get("tracklet_ids", [])} & allowed
+                if not tids:
+                    continue
+                signature = digest([group.get("role"), group.get("identity"), group.get("text_spans", [])])
+                if signature not in merged:
+                    merged[signature] = {**deepcopy(group), "tracklet_ids": []}
+                merged[signature]["tracklet_ids"] = sorted(set(merged[signature]["tracklet_ids"]) | tids)
+        groups = {i: {**g, "group_id": f"nlp-{i:03d}"} for i, g in enumerate(merged.values(), 1)}
+        mains = [i for i, g in groups.items() if g["role"] == "main_referent"]
+        mappings[sid] = {"nlp_groups": groups, "main_ids": mains}
+        entries.append({"sample_id": sid, "existing_text": row["text"], "negative": row["negative"],
+                        "allowed_ids": list(groups), "main_ids": mains,
+                        "existing_groups": [{"id": i, "role": g["role"], "identity": g.get("identity", ""),
+                                             "text_spans": g.get("text_spans", []),
+                                             "candidate_count": len(g["tracklet_ids"])} for i, g in groups.items()]})
+    for start in range(0, len(entries), args.group_size):
+        chunk = entries[start:start + args.group_size]
+        packet = {"stage": "nlp", "expressions": chunk, "frame_ids": [], "selected_frame_indices": []}
+        rid = digest([VERSION, "nlp-v1", prompt, packet])[:24]
+        manifest = {"request_id": rid, "stage": "nlp", "packet": packet, "images": [], "dimensions": [],
+                    "mapping": {e["sample_id"]: mappings[e["sample_id"]] for e in chunk},
+                    "max_output_tokens": min(16384, 4096 + 768 * len(chunk))}
+        atomic_json(output / "packets" / rid / "input.json", manifest)
+        packets.append(manifest)
+    atomic_json(output / "requests.json", [p["request_id"] for p in packets])
+    atomic_json(output / "heuristics.json", early)
+    return packets, early
+
+
 def prepare(source, ids, args, prompt, output):
     by_video = defaultdict(list)
     for sid in ids:
@@ -408,7 +500,8 @@ def prepare(source, ids, args, prompt, output):
     packets, early = [], {}
     try:
         for number, (key, sids) in enumerate(sorted(by_video.items()), 1):
-            registry, tracks, prepared = {}, {}, []
+            registry = dict(source.visual_registry(key)) if hasattr(source, "visual_registry") else {}
+            tracks, prepared = {}, []
             frames_key = None
             for sid in sorted(sids):
                 row = source.row(sid)
@@ -428,8 +521,8 @@ def prepare(source, ids, args, prompt, output):
                     signature = track_signature(row_frames, track)
                     if signature not in registry:
                         registry[signature] = len(registry) + 1
-                        tracks[registry[signature]] = track
                     vid = registry[signature]
+                    tracks[vid] = track
                     local_to_visual[track["tracklet_id"]] = vid
                     visual_to_local[vid] = track["tracklet_id"]
                 for alias, original in aliases.items():
@@ -443,7 +536,8 @@ def prepare(source, ids, args, prompt, output):
                          "allowed_ids": sorted(visual_to_local),
                          "main_ids": sorted({local_to_visual[t] for t in mains if t in local_to_visual}),
                          "target_source": row.get("target_source"), "existing_groups": groups}
-                prepared.append((entry, {"visual_to_local": visual_to_local, "main_ids": entry["main_ids"]}))
+                prepared.append((entry, {"visual_to_local": visual_to_local, "local_to_visual": local_to_visual,
+                                         "main_ids": entry["main_ids"]}))
             chunks, chunk, union = [], [], set()
             for item in prepared:
                 new_ids = set(item[0]["allowed_ids"])
@@ -476,7 +570,12 @@ def prepare(source, ids, args, prompt, output):
                             image = cv2.imread(str(path))
                             size = [image.shape[1], image.shape[0]]
                         else:
-                            payload, size = render_pair(media.frame(first, str(frames[index])), subset, index, str(frames[index]))
+                            cached = source.cached_pair(key, used, index) if hasattr(source, "cached_pair") else None
+                            if cached:
+                                cached_path, size = cached
+                                payload = cached_path.read_bytes()
+                            else:
+                                payload, size = render_pair(media.frame(first, str(frames[index])), subset, index, str(frames[index]))
                             temporary = path.with_suffix(".jpg.part")
                             temporary.write_bytes(payload)
                             temporary.replace(path)
@@ -508,6 +607,8 @@ def request_body(manifest, prompt, output):
         encoded = base64.b64encode((output / path).read_bytes()).decode("ascii")
         content.append({"type": "input_image", "detail": "high", "image_url": "data:image/jpeg;base64," + encoded})
     content.append({"type": "input_text", "text": dumps(manifest["packet"])})
+    if manifest.get("validation_retry_of"):
+        prompt += "\nYour previous output failed local validation. Correct the listed validation_errors while following every original task constraint."
     return {"model": MODEL, "reasoning": {"effort": "medium"}, "store": False,
             "instructions": prompt, "input": [{"role": "user", "content": content}],
             "text": {"format": {"type": "json_schema", "name": "concor_video_refinement", "strict": True, "schema": response_schema(manifest)}},
@@ -523,6 +624,8 @@ def response_schema(manifest):
     for expression in manifest["packet"]["expressions"]:
         item = deepcopy(prototype)
         properties = item["properties"]
+        if manifest.get("stage") == "nlp":
+            properties["decision"]["enum"] = ["keep", "rewrite"]
         properties["sample_id"]["enum"] = [expression["sample_id"]]
         if expression["negative"]:
             properties["tagged_caption"]["enum"] = ["", expression["existing_text"]]
@@ -643,26 +746,35 @@ def save_response(manifest, response, source, output):
                 result = {"sample_id": sid, "decision": "error", "reason_codes": [str(exc)], "model_result": result}
         if result["decision"] == "error":
             invalid.append(sid)
-        atomic_json(output / "decisions" / (digest(sid) + ".json"), {**result, "mapping": mapping, "request_id": manifest["request_id"], "stage": "model"})
+        provenance = {k: manifest[k] for k in ("transport_retry_of", "validation_retry_of") if k in manifest}
+        atomic_json(output / "decisions" / (digest(sid) + ".json"), {**result, **provenance, "mapping": mapping,
+                    "request_id": manifest["request_id"], "stage": manifest.get("stage", "model")})
     return invalid
 
 
-def run_regular(packets, prompt, source, output, ledger, client):
-    for index, manifest in enumerate(packets, 1):
+def run_regular(packets, prompt, source, output, ledger, client, workers=1, recover_interrupted=False):
+    # Only HTTP runs in threads; validation, source reads and SQLite reservations
+    # remain on the owning thread. Every call is reserved before submission.
+    from concurrent.futures import ThreadPoolExecutor
+    def finish(manifest, response):
+        invalid = save_response(manifest, response, source, output)
+        ledger.settle(manifest["request_id"], usage_cost(response.get("usage", {})))
+        print(dumps({"event": "completed", "stage": manifest.get("stage", "visual"),
+                     "request_id": manifest["request_id"], "invalid": len(invalid),
+                     "cost_upper_usd": round(ledger.total(), 6)}), flush=True)
+        return invalid
+    def response_for(manifest):
         rid = manifest["request_id"]
         path = output / "packets" / rid / "response.json"
         if path.is_file():
-            response = loads(path.read_text())
-            invalid = save_response(manifest, response, source, output)
-            ledger.settle(rid, usage_cost(response.get("usage", {})))
-        else:
-            if not ledger.reserve(rid, estimated_max_cost(manifest, prompt)):
-                raise RuntimeError(f"request {rid} has an unresolved prior charge; inspect before resubmitting")
-            print(dumps({"event": "calling", "request": index, "total": len(packets), "expressions": len(manifest["mapping"])}), flush=True)
-            response = client.call("POST", "/responses", json=request_body(manifest, prompt, output)).json()
-            invalid = save_response(manifest, response, source, output)
-            ledger.settle(rid, usage_cost(response.get("usage", {})))
-            print(dumps({"event": "completed", "request": index, "usage": response.get("usage", {}), "cost_upper_usd": round(ledger.total(), 6)}), flush=True)
+            return loads(path.read_text())
+        response = client.call("POST", "/responses", json=request_body(manifest, prompt, output)).json()
+        # Checkpoint before joining sibling requests: a slow peer or interruption
+        # must not strand a completed, potentially billed response in RAM.
+        atomic_json(path, response)
+        return response
+    def retry_invalid(manifest, invalid):
+        rid = manifest["request_id"]
         if invalid and not manifest.get("validation_retry_of"):
             # One protocol retry of only invalid results, using exactly the same
             # evidence and task. Never re-audit valid results or spend unreserved money.
@@ -671,12 +783,58 @@ def run_regular(packets, prompt, source, output, ledger, client):
             retry["validation_retry_of"] = rid
             retry["mapping"] = {sid: manifest["mapping"][sid] for sid in invalid}
             retry["packet"]["expressions"] = [e for e in manifest["packet"]["expressions"] if e["sample_id"] in invalid]
+            retry["packet"]["validation_errors"] = {
+                sid: loads((output / "decisions" / (digest(sid) + ".json")).read_text())["reason_codes"] for sid in invalid}
             atomic_json(output / "packets" / retry["request_id"] / "input.json", retry)
             request_ids = loads((output / "requests.json").read_text())
             if retry["request_id"] not in request_ids:
                 atomic_json(output / "requests.json", request_ids + [retry["request_id"]])
             print(dumps({"event": "validation_retry", "expressions": len(invalid)}), flush=True)
-            run_regular([retry], prompt, source, output, ledger, client)
+            run_regular([retry], prompt, source, output, ledger, client, recover_interrupted=recover_interrupted)
+    if not 1 <= workers <= 8:
+        raise ValueError("workers must be 1..8")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Bounded waves avoid pre-reserving the entire run and preserve all
+        # successful responses even if a sibling call raises a network error.
+        for start in range(0, len(packets), workers):
+            pending, errors, retries = [], [], []
+            for manifest in packets[start:start + workers]:
+                rid = manifest["request_id"]
+                if not (output / "packets" / rid / "response.json").is_file():
+                    try:
+                        if not ledger.reserve(rid, estimated_max_cost(manifest, prompt)):
+                            state = ledger.db.execute("SELECT state FROM charges WHERE id=?", (rid,)).fetchone()[0]
+                            if not recover_interrupted or manifest.get("transport_retry_of") or state != "reserved":
+                                raise RuntimeError(f"request {rid} has an unresolved prior charge; inspect before resubmitting")
+                            recovery = deepcopy(manifest)
+                            recovery["request_id"] = digest([rid, "transport-recovery-v1"])[:24]
+                            recovery["transport_retry_of"] = rid
+                            # A new ID accounts for a possible second charge. Never
+                            # release the original uncertain upper reservation.
+                            atomic_json(output / "packets" / recovery["request_id"] / "input.json", recovery)
+                            request_ids = loads((output / "requests.json").read_text())
+                            if recovery["request_id"] not in request_ids:
+                                atomic_json(output / "requests.json", request_ids + [recovery["request_id"]])
+                            manifest = recovery
+                            rid = manifest["request_id"]
+                            if not (output / "packets" / rid / "response.json").is_file() and not ledger.reserve(rid, estimated_max_cost(manifest, prompt)):
+                                raise RuntimeError(f"recovery {rid} also has an unresolved charge; no further automatic attempt")
+                            print(dumps({"event": "interrupted_recovery", "original_request": recovery["transport_retry_of"],
+                                         "request_id": rid, "original_reservation_retained": True}), flush=True)
+                    except RuntimeError as exc:
+                        errors.append(exc)
+                        break
+                pending.append((manifest, pool.submit(response_for, manifest)))
+            for manifest, future in pending:
+                try:
+                    retries.append((manifest, finish(manifest, future.result())))
+                except Exception as exc:
+                    errors.append(exc)
+            for manifest, invalid in retries:
+                retry_invalid(manifest, invalid)
+            release_memory()
+            if errors:
+                raise errors[0]
 
 
 def submit_batches(packets, prompt, output, ledger, client, wait_for=None):

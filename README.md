@@ -135,7 +135,90 @@ The HF root selects `train/verification.parquet` and `eval/unfiltered/verificati
 
 The script asks for the API key with hidden terminal input. It keeps the key in process memory, clears its session credential on exit and never writes it to checkpoints, command lines or logs. For automation it can consume `OPENAI_API_KEY` from the environment; remove any parent-shell copy yourself. Deleting a local copy does not revoke a key or erase a previously sent chat message. Resume with the same command and output directory; completed API responses are reused. Do not change the input or prompt within an existing run.
 
-### Full run, budget and outputs
+### Bounded two-pass density review
+
+[`scripts/refine_sample.py`](scripts/refine_sample.py) runs the new language pass
+before the standard visual pass. Its default is **100 Ref-YT-VOS videos + 100 ReVOS
+videos, one expression per video: 200 examples total**. It refuses more than 100
+videos per dataset. `--include-video 003234408d` counts within that limit and pins
+the penguin example separately in the viewer.
+
+1. Select 25 videos from each candidate-count range (0–2, 3–5, 6–12, 13+) per
+   dataset, with a deterministic seed. The densest annotated expression represents
+   each video. Videos without a local source archive/frame folder are excluded
+   before sampling and counted in `selection.json`. This is a density stress sample, not a verified count of
+   real objects or a random estimate of corpus error rates.
+2. Apply the existing structural checks, remove empty context, and deduplicate
+   exactly equal mask sequences. Structural failures remain visible as rejections.
+3. Run a **text-only GPT-6 Luna / medium** pass using
+   [`prompts/nlp_cleanup.md`](prompts/nlp_cleanup.md). Preserve every original
+   character and the intended target; repair noun boundaries and remove bogus
+   entity links such as face masks attached to the verb “facing.” Candidate masks
+   for a genuine noun remain together for later visual selection. This pass cannot
+   reject a sentence or infer visual correctness. Local validation also forbids a
+   standalone “facing” entity span in both passes.
+4. Render the cleaned candidates and run the standard **GPT-6 Luna / medium**
+   visual refinement, with the same VIPOSeg presentation and sampling policy.
+5. Validate exact spans, target preservation and both BCC directions, then export
+   the original 22-column Arrow schema and full retained mask sequences. Each
+   stage allows one validation retry; errors remain distinct from rejection.
+
+~~~bash
+python scripts/refine_sample.py --input data/hf --media-root /data/concor-video \
+  --output outputs/luna-density-200 --include-video 003234408d \
+  --mode prepare --budget-usd 20 --prior-spend-usd 0.02981
+
+# Load OPENAI_API_KEY privately into the environment; .env is not auto-loaded.
+python scripts/refine_sample.py --input data/hf --media-root /data/concor-video \
+  --output outputs/luna-density-200 --include-video 003234408d \
+  --mode regular --workers 4 --budget-usd 20 --prior-spend-usd 0.02981
+
+python scripts/build_refinement_viewer.py --input data/hf \
+  --run outputs/luna-density-200 --output outputs/pilot-viewer/dist
+~~~
+
+Preparation sends **no API requests**. It saves the exact selection and original
+input snapshot, prepares evidence, and bounds both stages including one retry.
+The two stages share one durable budget ledger. Set `--prior-spend-usd` to all
+other charges/reservations; the wrapper enforces a combined $100 ceiling. Resume
+with the same inputs, prompts, arguments and output directory. Four HTTP calls may
+run concurrently; checkpoint validation and ledger writes remain serialized.
+Responses checkpoint immediately, and temporary Arrow/RLE buffers are released
+between request waves to keep memory bounded. After a confirmed process interruption,
+`--recover-interrupted` permits at most one replacement request under a new ID for
+each unresolved reservation. Its original maximum charge remains in the ledger;
+replacement calls also reserve budget, and unresolved replacements are never
+automatically repeated. Without this explicit option, uncertain calls still stop
+the run. `summary.json` reports their conservative cost separately.
+`--expressions-per-video 0` explicitly expands to every expression of the selected
+videos; the default stays at 200 expressions. The viewer shows original → NLP →
+visual links, density filters, removed groups, exact visual inputs, and outcomes
+of the early filters. The original-candidate view is for human audit only and is
+not sent in an additional visual model call. No HF upload or full run occurs.
+
+Completed **2026-10-10**, seed `20261010`, in
+`outputs/luna-density-200-20261010-available`: exactly **200 videos / expressions**,
+100 per dataset and 25 per candidate-density range in each dataset. The 507 videos
+whose local source archive was unavailable were excluded before sampling.
+NLP cleanup kept 151 expressions and repaired 49, removing 57 candidate tracks;
+the structural checks removed no additional tracks in this sample. Visual results:
+**163 rewrites, 25 keeps, 11 rejections, 1 validation error**. The invalid result
+dropped intended target IDs even after its one retry and remains excluded from
+the export, separately from semantic rejections. The 188 retained rows export as
+155 train and 33 val rows, with exact source schemas and unchanged retained mask
+sequences verified. The featured `003234408d` goes
+from **35 → 27 → 2 tracks**: NLP removes eight face candidates incorrectly linked
+to “facing,” then visual refinement retains the target and neighboring penguin.
+
+The [hosted review viewer](https://concor-video-refinement-pilot.daisydv.chatgpt.site)
+shows all 200 outcomes, including the failed proposal. Conservative run cost is
+**$0.651928**, including **$0.053501** reserved for three calls interrupted by a
+local memory-limit kill; their replacements were charged separately. Including
+the earlier $0.02981 pilot, the conservative total is **$0.681738**. Checkpoints
+and reservations are preserved. These are review results, not a measured accuracy
+score or a full-corpus release; HF remains unchanged.
+
+### Full-corpus commands (not part of the 200-video review)
 
 Prepare inputs and inspect the conservative reservation before submitting:
 
@@ -149,7 +232,7 @@ python scripts/refine_hf.py \
   --output outputs/luna-full --mode batch --budget-usd 95 --wait
 ~~~
 
-The $5 pilot allowance plus $95 full-run allowance keeps the two runs within the **$100 API budget**. Each output directory has a durable reservation ledger. Pending/uncertain charges continue counting against it. A preflight above the allowance sends no requests; reaching the limit preserves pending work, never labels it bad data. A reservation is conservative, not an OpenAI account spending limit: keep prices current and do not bypass the ledger by copying runs. After a submission/network interruption, collect known batches before investigating unresolved reservations; the script refuses to blindly repeat potentially billed calls.
+The original $5 pilot / $95 full-run split was a planning allowance. After any additional pilot, subtract **all** actual charges and outstanding reservations from the $100 total before choosing a full-run allowance. Each output directory has a durable reservation ledger. Pending/uncertain charges continue counting against it. A preflight above the allowance sends no requests; reaching the limit preserves pending work, never labels it bad data. A reservation is conservative, not an OpenAI account spending limit: keep prices current and do not bypass the ledger by copying runs. After a submission/network interruption, collect known batches before investigating unresolved reservations; the script refuses to blindly repeat potentially billed calls.
 
 Pricing checked 2026-10-07: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) costs $0.10 input / $0.50 output per million standard tokens ($0.125 cache writes; $0.01 cache hits); [Batch](https://developers.openai.com/api/docs/guides/batch) halves those rates and has a 24-hour completion window. The ledger includes reasoning output, reserves the output ceiling, assumes no cache hits, accounts for cache writes and long-context premiums, and settles from returned usage. Image billing estimates deliberately overestimate patch tokens. Input rendering time and your account's Batch queue limit also affect ETA; multiple queue waves can take longer than 24 hours. Shared evidence reduces cost without lowering the requested model or visual resolution.
 

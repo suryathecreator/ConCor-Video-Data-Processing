@@ -83,6 +83,9 @@ its own allowed_ids. Never mix results or main referents between expressions.
 16. Distinguish concrete nouns from actions: "the building" can name an entity; "they
     are building" is a verb. A concrete entity named in the final positive text cannot
     remain unlinked just because it is contextual or the expression is complicated.
+    "Facing" in "a penguin facing it" is a verb and must never receive an entity
+    tag or a face mask. Any preceding language cleanup is fallible; maintain this
+    rule in the final output too. Never restore candidates removed by that cleanup.
 17. Preserve fixed counter phrases such as "a pair of glasses" and proper names with
     "of". For a container and contents, use separate phrases or a full shared phrase
     only when the corresponding tracks support that reading. For partitives, link
