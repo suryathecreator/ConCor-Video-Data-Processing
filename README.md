@@ -174,7 +174,7 @@ python scripts/refine_sample.py --input data/hf --media-root /data/concor-video 
   --mode regular --workers 4 --budget-usd 20 --prior-spend-usd 0.02981
 
 python scripts/build_refinement_viewer.py --input data/hf \
-  --run outputs/luna-density-200 --output outputs/pilot-viewer/dist
+  --run outputs/luna-density-200 --output outputs/pilot-viewer/dist --webp-quality 76
 ~~~
 
 Preparation sends **no API requests**. It saves the exact selection and original
@@ -195,6 +195,12 @@ videos; the default stays at 200 expressions. The viewer shows original → NLP 
 visual links, density filters, removed groups, exact visual inputs, and outcomes
 of the early filters. The original-candidate view is for human audit only and is
 not sent in an additional visual model call. No HF upload or full run occurs.
+
+The viewer uses original JPEGs by default. Optional `--webp-quality 76` makes compact
+display copies at the same dimensions, keeping every sampled frame and overlay.
+This lets the 200-example viewer fit Sites' 256 MiB upload limit; it labels the
+display encoding explicitly. The model still receives the original quality-88
+JPEGs, which remain saved in the run checkpoints. No model calls are repeated.
 
 Completed **2026-10-10**, seed `20261010`, in
 `outputs/luna-density-200-20261010-available`: exactly **200 videos / expressions**,

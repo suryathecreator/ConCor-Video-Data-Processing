@@ -3,13 +3,55 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import re
 import shutil
 from pathlib import Path
 
-from refine_hf import Source, apply_result, color_for, digest, discover_inputs, loads
+import cv2
+
+from refine_hf import Source, apply_result, color_for, digest, discover_inputs, loads, release_memory
+
+
+def compact_images(destination, data, quality):
+    """Encode display copies only; original model-input JPEGs stay in the run."""
+    if not 0 <= quality <= 100:
+        raise ValueError('WebP quality must be 0..100')
+    cv2.setNumThreads(1)
+    paths = sorted({path for sample in data['samples']
+                    for field in ('images', 'original_images') for path in sample[field]})
+
+    def encode(relative):
+        frame = cv2.imread(str(destination / relative))
+        if frame is None:
+            raise ValueError('Unreadable viewer image: ' + relative)
+        ok, encoded = cv2.imencode('.webp', frame, [cv2.IMWRITE_WEBP_QUALITY, quality])
+        if not ok:
+            raise ValueError('WebP encoding failed: ' + relative)
+        payload = encoded.tobytes()
+        target = destination / 'assets' / (hashlib.sha256(payload).hexdigest() + '.webp')
+        target.write_bytes(payload)
+        return relative, str(target.relative_to(destination))
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        mapping = dict(pool.map(encode, paths))
+    for sample in data['samples']:
+        for field in ('images', 'original_images'):
+            sample[field] = [mapping[path] for path in sample[field]]
+    data['image_encoding'] = {'format': 'webp', 'quality': quality, 'exact_jpeg': False}
+
+
+def write_viewer(destination, data):
+    (destination / 'index.html').write_text(Path(__file__).with_name('refinement_viewer.html').read_text(), encoding='utf-8')
+    (destination / 'data.json').write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    used = {path for sample in data['samples']
+            for field in ('images', 'original_images') for path in sample[field]}
+    # Remove only this builder's unused content-addressed display assets.
+    for path in (destination / 'assets').glob('*'):
+        if re.fullmatch(r'[0-9a-f]{64}\.(jpg|webp)', path.name) and str(path.relative_to(destination)) not in used:
+            path.unlink()
 
 
 def manifests_by_sample(directory):
@@ -39,7 +81,7 @@ def links_for(row, local_to_visual):
     return links, corrected
 
 
-def build(input_path, run, destination):
+def build(input_path, run, destination, webp_quality=None):
     snapshot = run / 'input/selected.parquet'
     source = Source([snapshot] if snapshot.exists() else discover_inputs(input_path))
     config = loads((run / 'run.json').read_text())
@@ -123,9 +165,12 @@ def build(input_path, run, destination):
     for path in sorted(run.glob('*.parquet')) + [run / n for n in ['selection.json', 'summary.json', 'audit.json', 'preflight.json', 'verification.json'] if (run / n).exists()]:
         shutil.copyfile(path, destination / path.name)
         downloads.append(path.name)
-    (destination / 'index.html').write_text(Path(__file__).with_name('refinement_viewer.html').read_text(), encoding='utf-8')
-    (destination / 'data.json').write_text(json.dumps({'summary': summary, 'selection': selection,
-                                                     'colors': colors, 'samples': samples, 'downloads': downloads}, ensure_ascii=False), encoding='utf-8')
+    data = {'summary': summary, 'selection': selection, 'colors': colors, 'samples': samples,
+            'downloads': downloads, 'image_encoding': {'format': 'jpeg', 'quality': 88, 'exact_jpeg': True}}
+    if webp_quality is not None:
+        release_memory()
+        compact_images(destination, data, webp_quality)
+    write_viewer(destination, data)
     print(f'Built viewer for {len(samples)} expressions at {destination}')
 
 
@@ -134,5 +179,8 @@ if __name__ == '__main__':
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--run', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--webp-quality', type=int, help='Optional compact display copies, 0..100; leaves model inputs unchanged')
     args = parser.parse_args()
-    build(args.input, args.run.resolve(), args.output.resolve())
+    if args.webp_quality is not None and not 0 <= args.webp_quality <= 100:
+        parser.error('--webp-quality must be 0..100')
+    build(args.input, args.run.resolve(), args.output.resolve(), args.webp_quality)
