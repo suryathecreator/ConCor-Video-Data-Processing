@@ -12,7 +12,8 @@ from pathlib import Path
 
 import cv2
 
-from refine_hf import Source, apply_result, color_for, digest, discover_inputs, loads, release_memory
+from refine_hf import Media, Source, apply_result, color_for, digest, discover_inputs, loads, release_memory
+from viewer_masks import interactive_sample
 
 
 def compact_images(destination, data, quality):
@@ -45,12 +46,19 @@ def compact_images(destination, data, quality):
 
 def write_viewer(destination, data):
     (destination / 'index.html').write_text(Path(__file__).with_name('refinement_viewer.html').read_text(), encoding='utf-8')
+    shutil.copyfile(Path(__file__).with_name('refinement_viewer.js'), destination / 'viewer.js')
     (destination / 'data.json').write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
     used = {path for sample in data['samples']
             for field in ('images', 'original_images') for path in sample[field]}
+    descriptors = {s['mask_data'] for s in data['samples'] if s.get('mask_data')}
+    for relative in descriptors:
+        used.update(loads((destination / relative).read_text())['assets'])
     # Remove only this builder's unused content-addressed display assets.
     for path in (destination / 'assets').glob('*'):
-        if re.fullmatch(r'[0-9a-f]{64}\.(jpg|webp)', path.name) and str(path.relative_to(destination)) not in used:
+        if re.fullmatch(r'[0-9a-f]{64}\.(jpg|webp|png)', path.name) and str(path.relative_to(destination)) not in used:
+            path.unlink()
+    for path in (destination / 'masks').glob('*.json'):
+        if re.fullmatch(r'[0-9a-f]{64}\.json', path.name) and str(path.relative_to(destination)) not in descriptors:
             path.unlink()
 
 
@@ -81,7 +89,7 @@ def links_for(row, local_to_visual):
     return links, corrected
 
 
-def build(input_path, run, destination, webp_quality=None):
+def build(input_path, run, destination, webp_quality=None, media_roots=None):
     snapshot = run / 'input/selected.parquet'
     source = Source([snapshot] if snapshot.exists() else discover_inputs(input_path))
     config = loads((run / 'run.json').read_text())
@@ -93,10 +101,15 @@ def build(input_path, run, destination, webp_quality=None):
     selected = {sid: video for video in selection['videos'] for sid in video['sample_ids']}
     destination.mkdir(parents=True, exist_ok=True)
     samples, colors = [], {}
+    media = Media(media_roots, run / 'media-index') if media_roots else None
+    cv2.setNumThreads(1)
 
     def copy_images(manifest, base, prefix=''):
         images, frame_ids = [], []
         for relative, index in zip(manifest.get('images', []), manifest.get('packet', {}).get('selected_frame_indices', [])):
+            frame_ids.append(str(manifest['packet']['frame_ids'][index]))
+            if media:
+                continue
             payload = (base / relative).read_bytes()
             # Identical before/after evidence shares one immutable static asset.
             target = destination / 'assets' / (hashlib.sha256(payload).hexdigest() + '.jpg')
@@ -104,7 +117,6 @@ def build(input_path, run, destination, webp_quality=None):
             if not target.exists():
                 target.write_bytes(payload)
             images.append(str(target.relative_to(destination)))
-            frame_ids.append(str(manifest['packet']['frame_ids'][index]))
         return images, frame_ids
 
     for sid in config['selected_ids']:
@@ -160,6 +172,11 @@ def build(input_path, run, destination, webp_quality=None):
                         'original_ids': old_entry.get('allowed_ids', []), 'retained_ids': retained,
                         'images': images, 'frame_ids': frame_ids, 'original_images': original_images,
                         'original_frame_ids': original_frame_ids, 'group_size': len(manifest.get('mapping', {}))})
+        if media:
+            interactive_sample(samples[-1], original, old_mapping, mapping, media, destination,
+                               webp_quality if webp_quality is not None else 76)
+            print(f'Interactive masks: {len(samples)}/{len(config["selected_ids"])} · {original["video_id"]}', flush=True)
+        release_memory()
     samples.sort(key=lambda s: not s['featured'])
     downloads = []
     for path in sorted(run.glob('*.parquet')) + [run / n for n in ['selection.json', 'summary.json', 'audit.json', 'preflight.json', 'verification.json'] if (run / n).exists()]:
@@ -167,7 +184,11 @@ def build(input_path, run, destination, webp_quality=None):
         downloads.append(path.name)
     data = {'summary': summary, 'selection': selection, 'colors': colors, 'samples': samples,
             'downloads': downloads, 'image_encoding': {'format': 'jpeg', 'quality': 88, 'exact_jpeg': True}}
-    if webp_quality is not None:
+    if media:
+        media.close()
+        data['image_encoding'] = {'format': 'webp', 'quality': webp_quality if webp_quality is not None else 76,
+                                  'exact_jpeg': False, 'interactive_masks': True, 'mask_format': 'lossless_rgb_bitplanes'}
+    elif webp_quality is not None:
         release_memory()
         compact_images(destination, data, webp_quality)
     write_viewer(destination, data)
@@ -180,7 +201,9 @@ if __name__ == '__main__':
     parser.add_argument('--run', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--webp-quality', type=int, help='Optional compact display copies, 0..100; leaves model inputs unchanged')
+    parser.add_argument('--media-root', type=Path, action='append',
+                        help='Build interactive caption/span masks from local media; repeat for multiple roots. No API calls.')
     args = parser.parse_args()
     if args.webp_quality is not None and not 0 <= args.webp_quality <= 100:
         parser.error('--webp-quality must be 0..100')
-    build(args.input, args.run.resolve(), args.output.resolve(), args.webp_quality)
+    build(args.input, args.run.resolve(), args.output.resolve(), args.webp_quality, args.media_root)

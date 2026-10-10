@@ -217,7 +217,12 @@ from **35 → 27 → 2 tracks**: NLP removes eight face candidates incorrectly l
 to “facing,” then visual refinement retains the target and neighboring penguin.
 
 The [hosted review viewer](https://concor-video-refinement-pilot.daisydv.chatgpt.site)
-shows all 200 outcomes, including the failed proposal. Conservative run cost is
+is public and shows all 200 outcomes, including the failed proposal. Click any
+caption to show only its linked masks; click a colored span to isolate its BCC
+link, or an ID chip to isolate one mask. Caption selection switches to the
+matching before/after-NLP evidence. Click elsewhere or press Escape to restore
+all masks for that view. Overlapping masks remain independently selectable.
+Conservative run cost is
 **$0.651928**, including **$0.053501** reserved for three calls interrupted by a
 local memory-limit kill; their replacements were charged separately. Including
 the earlier $0.02981 pilot, the conservative total is **$0.681738**. Checkpoints
@@ -262,6 +267,22 @@ python -m http.server 8000 --directory outputs/pilot-viewer
 ~~~
 
 The static viewer includes exact shared input images, original/refined spans, retained IDs, rejection reasons and split Parquet downloads. It can be hosted without an API key. Dataset media keeps its upstream terms; do not commit generated pilot assets to the source branch.
+
+To build interactive masks for an existing run, supply local media:
+
+~~~bash
+python scripts/build_refinement_viewer.py --input data/hf \
+  --run outputs/luna-density-200-20261010-available \
+  --output outputs/pilot-viewer/dist --media-root /data/concor-video \
+  --webp-quality 76
+~~~
+
+This reads only the run's selected examples and sampled frame indices. It makes
+no API calls and preserves all model results. The interactive display combines
+compact original frames with separate lossless mask layers at up to 540px
+height; selecting an absent mask displays no overlay. The original quality-88
+model-input JPEGs remain in the run checkpoints. Per-example mask assets resume
+on rebuild, and the static site contains no credentials.
 
 Pilot completed **2026-10-07** with seed `20261007`: 10 Ref-YouTube-VOS and 10 ReVOS expressions, 10 shared initial requests and one validation retry. Results: **11 rewrites, 4 keeps, 5 rejections, 0 unresolved errors**; `train.parquet` has 9 retained rows and `val.parquet` has 6, both with the exact source schema. Usage was 211,515 input and 10,114 output tokens, costing approximately **$0.02981** including the retry. Scaling the observed cost per expression to 50,083 expressions at Batch prices gives **about $37**, before any further sharing benefit from larger groups. This small-pilot projection is not a quote; the full workload's preflight and $95 ledger allowance govern submission. The pilot verifies the workflow and surfaces examples for inspection, not a corpus-level quality score.
 
