@@ -19,6 +19,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 import zipfile
 from collections import Counter, defaultdict
 from functools import lru_cache
@@ -41,6 +42,8 @@ MODEL = "gpt-6-luna"
 VERSION = "concor-refine-v2"
 MAX_ENTITY_TRACKS = 10
 API = "https://api.openai.com/v1"
+BATCH_MAX_REQUESTS = 50_000
+BATCH_MAX_BYTES = 200_000_000
 META = ["sample_id", "dataset", "split", "video_id", "cohort", "text", "negative", "groups_json", "disposition"]
 TAG = re.compile(r"\[(/?)([1-9][0-9]*)\]")
 RESULT_SCHEMA = {
@@ -716,6 +719,60 @@ class Ledger:
         with self.db:
             self.db.execute("UPDATE charges SET amount=?,state='completed' WHERE id=?", (amount, request_id))
 
+    def reserve_batch(self, costs):
+        """Atomically reserve a journaled submission, including crash recovery."""
+        with self.db:
+            extra = 0.
+            for rid, amount in costs:
+                old = self.db.execute("SELECT amount,state FROM charges WHERE id=?", (rid,)).fetchone()
+                if old and old[1] != "unsubmitted":
+                    if old != (amount, "reserved"):
+                        raise RuntimeError("batch reservation conflicts with a previous charge")
+                else:
+                    extra += amount
+            if self.total() + extra > self.limit:
+                raise RuntimeError("budget limit reached; pending work is preserved, never rejected for cost")
+            self.db.executemany("INSERT OR REPLACE INTO charges VALUES (?,?,'reserved')", costs)
+
+    def release_unsubmitted(self, request_ids):
+        # Only call after explicit API rejection BEFORE any inference. Keep the
+        # zero-cost entries and rejection receipts as a durable audit trail.
+        with self.db:
+            self.db.executemany("UPDATE charges SET amount=0,state='unsubmitted' WHERE id=? AND state='reserved'",
+                                [(rid,) for rid in request_ids])
+
+
+def queue_rejection_info(errors):
+    """Extract queue feedback without ever retaining/logging an API message."""
+    if isinstance(errors, dict):
+        errors = errors.get("data", [errors])
+    if not isinstance(errors, list):
+        return None
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        code, message = str(error.get("code", "")), str(error.get("message", ""))
+        queue = code in {"token_limit_exceeded", "batch_token_limit_exceeded", "enqueued_token_limit_exceeded"}
+        queue |= "token" in message.lower() and any(s in message.lower() for s in ("enqueued", "queue limit", "queued token"))
+        if queue:
+            match = re.search(r"\blimit\s*:\s*([\d,]+)", message, re.I)
+            return {"kind": "queue_tokens", "limit_tokens": int(match[1].replace(",", "")) if match else None}
+    return None
+
+
+class APIError(RuntimeError):
+    def __init__(self, status_code, error):
+        error = error if isinstance(error, dict) else {}
+        code = str(error.get("code") or "request_failed")
+        self.status_code = status_code
+        self.queue_info = queue_rejection_info([error])
+        self.creation_rate_limited = status_code == 429 and code == "rate_limit_exceeded" and not self.queue_info
+        # A server/proxy can return arbitrary error text, including credentials.
+        safe_code = code if code in {"rate_limit_exceeded", "token_limit_exceeded", "batch_token_limit_exceeded",
+            "enqueued_token_limit_exceeded", "invalid_api_key", "insufficient_quota", "invalid_request_error",
+            "permission_denied", "model_not_found", "request_failed", "server_error"} else "request_failed"
+        super().__init__(f"OpenAI HTTP {status_code}: {safe_code}")
+
 
 class APIClient:
     def __init__(self):
@@ -730,11 +787,12 @@ class APIClient:
         response = self.session.request(method, API + endpoint, timeout=(30, 900), **kwargs)
         if not response.ok:
             try:
-                kind = response.json().get("error", {}).get("code") or "request_failed"
+                payload = response.json()
+                error = payload.get("error") if isinstance(payload, dict) else None
             except ValueError:
-                kind = "request_failed"
+                error = None
             # Never log API error messages or headers: some echo the credential.
-            raise RuntimeError(f"OpenAI HTTP {response.status_code}: {kind}")
+            raise APIError(response.status_code, error)
         return response
 
     def close(self):
@@ -867,70 +925,207 @@ def run_regular(packets, prompt, source, output, ledger, client, workers=1, reco
                 raise errors[0]
 
 
-def submit_batches(packets, prompt, output, ledger, client, wait_for=None):
+def _record_batch(output, batches, record, remote):
+    entry = {"id": remote["id"], "requests": record["requests"],
+             "input_file_id": record["input_file_id"], "submission_id": record["submission_id"]}
+    if not any(b["id"] == entry["id"] for b in batches):
+        batches.append(entry)
+        atomic_json(output / "batches.json", batches)
+    record.update(state="submitted", batch_id=entry["id"])
+
+
+def _send_batch(record, journal, output, batches, ledger, client):
+    """Checkpoint BEFORE paid submission; never blindly retry an uncertain POST."""
+    if record["state"] == "submitting":
+        # Recover a response lost after OpenAI accepted the submission. Matching
+        # both our unique metadata ticket and file avoids duplicate paid work.
+        after, found = None, []
+        while True:
+            params = {"limit": 100, **({"after": after} if after else {})}
+            page = client.call("GET", "/batches", params=params).json()
+            for batch in page.get("data", []):
+                if ((batch.get("metadata") or {}).get("concor_submission") == record["submission_id"]
+                        and batch.get("input_file_id") == record["input_file_id"]):
+                    found.append(batch)
+            if not page.get("has_more") or not page.get("data"):
+                break
+            after = page["data"][-1]["id"]
+        if len(found) != 1:
+            raise RuntimeError("uncertain Batch submission; reservations preserved, automatic resubmission refused")
+        _record_batch(output, batches, record, found[0])
+        atomic_json(journal, record)
+        return
+    if record["state"] in {"submitted", "queue_rejected", "rate_limited"}:
+        if record["state"] != "submitted" and not record.get("reservation_released"):
+            ledger.release_unsubmitted(record["requests"])
+            record["reservation_released"] = True
+            atomic_json(journal, record)
+        return
+    path = output / record["input_path"]
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(block)
+    if hasher.hexdigest() != record["sha256"]:
+        raise ValueError("journaled Batch input changed; refusing submission")
+    ledger.reserve_batch(record["costs"])
+    record["state"] = "reserved" if not record.get("input_file_id") else "uploaded"
+    atomic_json(journal, record)
+    if not record.get("input_file_id"):
+        with path.open("rb") as handle:
+            record["input_file_id"] = client.call("POST", "/files", data={"purpose": "batch"},
+                files={"file": (path.name, handle, "application/jsonl")}).json()["id"]
+        record["state"] = "uploaded"
+        atomic_json(journal, record)
+    record["state"] = "submitting"
+    atomic_json(journal, record)
+    try:
+        remote = client.call("POST", "/batches", json={"input_file_id": record["input_file_id"],
+            "endpoint": "/v1/responses", "completion_window": "24h",
+            "metadata": {"concor_submission": record["submission_id"]}}).json()
+    except APIError as exc:
+        if exc.status_code not in {400, 429} or (not exc.queue_info and not exc.creation_rate_limited):
+            raise
+        record.update(state="queue_rejected" if exc.queue_info else "rate_limited",
+                      queue_info=exc.queue_info, http_status=exc.status_code)
+        atomic_json(journal, record)  # Explicit rejection, no batch was created.
+        ledger.release_unsubmitted(record["requests"])
+        record["reservation_released"] = True
+        atomic_json(journal, record)
+        return
+    _record_batch(output, batches, record, remote)
+    atomic_json(journal, record)
+    print(dumps({"event": "batch_submitted", "id": remote["id"], "requests": len(record["requests"]),
+                 "bytes": path.stat().st_size}), flush=True)
+
+
+def _batch_states(batches, output, ledger, client):
+    states = {}
+    for batch in batches:
+        receipt = output / "batch-receipts" / (batch["id"] + ".json")
+        status = loads(receipt.read_text()) if receipt.exists() else client.call("GET", "/batches/" + batch["id"]).json()
+        info = queue_rejection_info(status.get("errors"))
+        if (status["status"] == "failed" and info and not status.get("output_file_id")
+                and not status.get("error_file_id") and not (status.get("request_counts") or {}).get("completed")):
+            status = {"id": batch["id"], "status": "failed", "queue_rejected": True, "queue_info": info}
+            atomic_json(receipt, status)
+        if status.get("queue_rejected") and not status.get("reservation_released"):
+            ledger.release_unsubmitted(batch["requests"])
+            status["reservation_released"] = True
+            atomic_json(receipt, status)
+        states[batch["id"]] = status
+    return states
+
+
+def submit_batches(packets, prompt, output, ledger, client, collect=None, wait=False):
+    """Fill the real API queue; only API file/count limits and dollars cap packing.
+
+    Queue admission is authoritative, including when a project key cannot read
+    admin rate limits. Split/back off only after an explicit pre-inference queue
+    rejection; never cancel or resend accepted work. Journals survive restarts.
+    """
     existing = output / "batches.json"
     batches = loads(existing.read_text()) if existing.exists() else []
-    submitted = {rid for batch in batches for rid in batch["requests"]}
-    if batches and wait_for:
-        wait_for(batches)
-    elif batches:
-        for batch in batches:
-            status = client.call("GET", "/batches/" + batch["id"]).json()["status"]
-            if status not in {"completed", "failed", "expired", "cancelled"}:
+    journals = {}
+    for path in sorted((output / "submissions").glob("*.json")):
+        record = loads(path.read_text())
+        if any(b.get("submission_id") == record["submission_id"] for b in batches):
+            record["state"] = "submitted"
+        _send_batch(record, path, output, batches, ledger, client)
+        journals[record["submission_id"]] = record
+    capacity_path = output / "queue-capacity.json"
+    capacity = loads(capacity_path.read_text()) if capacity_path.exists() else {"seen": [], "request_ceiling": BATCH_MAX_REQUESTS}
+    terminal = {"completed", "failed", "expired", "cancelled"}
+    while True:
+        # Collection is nonblocking: a slow earlier batch cannot hold up either
+        # new submissions or collection of later completed batches.
+        if collect:
+            states = collect(batches)
+        else:
+            states = _batch_states(batches, output, ledger, client)
+        active = {bid for bid, state in states.items() if state["status"] not in terminal}
+        if set(capacity.get("active_at_rejection", [])) - active:
+            capacity.update(request_ceiling=BATCH_MAX_REQUESTS, active_at_rejection=[])
+        feedback = [(b["id"], len(b["requests"]), states[b["id"]].get("queue_info"), False)
+                    for b in batches if states[b["id"]].get("queue_rejected")]
+        feedback += [(ticket, len(r["requests"]), r.get("queue_info"), r["state"] == "rate_limited")
+                     for ticket, r in journals.items() if r["state"] in {"queue_rejected", "rate_limited"}]
+        for ticket, count, info, rate_limited in feedback:
+            if ticket in capacity["seen"]:
+                continue
+            capacity["seen"].append(ticket)
+            if not rate_limited:
+                capacity.update(request_ceiling=max(1, min(capacity["request_ceiling"], count // 2)),
+                                active_at_rejection=sorted(active), last_api_queue_info=info)
+            if count == 1 or rate_limited:
+                capacity["next_attempt_unix"] = time.time() + 30
+            print(dumps({"event": "batch_capacity", "source": "api_rejection", "queue_info": info,
+                         "retry_request_ceiling": capacity["request_ceiling"]}), flush=True)
+        atomic_json(capacity_path, capacity)
+        submitted = {rid for batch in batches if not states[batch["id"]].get("queue_rejected") for rid in batch["requests"]}
+        pending = [p for p in packets if p["request_id"] not in submitted
+                   and not (output / "packets" / p["request_id"] / "response.json").exists()]
+        if not pending:
+            if not wait or not active:
                 return batches
-    lines, active, size, input_tokens = [], [], 0, 0
-    def submit():
-        nonlocal lines, active, size, input_tokens
-        if not lines:
-            return
-        path = output / f"batch-{len(batches):04d}.jsonl"
-        with path.open("wb") as handle:
-            handle.writelines(lines)
-        with path.open("rb") as handle:
-            file_id = client.call("POST", "/files", data={"purpose": "batch"}, files={"file": (path.name, handle, "application/jsonl")}).json()["id"]
-        # Reserves are already durable; a crash after submission never blindly
-        # repeats paid requests. The batch ID is checkpointed immediately.
-        batch = client.call("POST", "/batches", json={"input_file_id": file_id, "endpoint": "/v1/responses", "completion_window": "24h"}).json()
-        batches.append({"id": batch["id"], "requests": active, "input_file_id": file_id})
-        atomic_json(existing, batches)
-        if wait_for:
-            wait_for([batches[-1]])
-        lines, active, size, input_tokens = [], [], 0, 0
-    for manifest in packets:
-        rid = manifest["request_id"]
-        if rid in submitted or (output / "packets" / rid / "response.json").exists():
+            time.sleep(30)
             continue
-        line = (dumps({"custom_id": rid, "method": "POST", "url": "/v1/responses", "body": request_body(manifest, prompt, output)}) + "\n").encode()
-        if len(line) > 180_000_000:
-            raise ValueError("one request exceeds the Batch file budget; reduce expression group size")
-        bound = input_token_bound(manifest, prompt)
-        if bound > 16_000_000:
-            raise ValueError("one request exceeds the conservative Batch token queue bound")
-        if lines and (size + len(line) > 180_000_000 or len(lines) >= 1000 or input_tokens + bound > 16_000_000):
-            submit()
-            if not wait_for:
-                # Async mode submits one bounded wave. Run --mode batch again
-                # after collection, or use --wait to finish every wave in order.
+        if time.time() < capacity.get("next_attempt_unix", 0):
+            if not wait:
                 return batches
-        if not ledger.reserve(rid, estimated_max_cost(manifest, prompt, batch=True)):
-            raise RuntimeError(f"unresolved submission for {rid}; collect existing batches before retrying")
-        lines.append(line)
-        active.append(rid)
-        size += len(line)
-        input_tokens += bound
-    submit()
-    return batches
+            time.sleep(min(30, max(0, capacity["next_attempt_unix"] - time.time())))
+            continue
+        lines, costs, size = [], [], 0
+        available = ledger.limit - ledger.total()
+        for manifest in pending:
+            rid = manifest["request_id"]
+            old = ledger.db.execute("SELECT state FROM charges WHERE id=?", (rid,)).fetchone()
+            if old and old[0] != "unsubmitted":
+                raise RuntimeError(f"unresolved submission for {rid}; reservation retained, refusing duplicate")
+            amount = estimated_max_cost(manifest, prompt, batch=True)
+            if amount > available:
+                break
+            line = (dumps({"custom_id": rid, "method": "POST", "url": "/v1/responses",
+                           "body": request_body(manifest, prompt, output)}) + "\n").encode()
+            if len(line) > BATCH_MAX_BYTES:
+                raise ValueError("one request exceeds OpenAI's 200 MB Batch file limit")
+            if lines and (size + len(line) > BATCH_MAX_BYTES or len(lines) >= capacity["request_ceiling"]):
+                break
+            lines.append(line); costs.append([rid, amount]); size += len(line); available -= amount
+        if not lines:
+            if active:
+                print(dumps({"event": "waiting_for_budget_settlement", "reserved_and_spent_usd": ledger.total()}), flush=True)
+                if not wait:
+                    return batches
+                time.sleep(30)
+                continue
+            raise RuntimeError("budget limit reached; pending work is preserved, never rejected for cost")
+        ticket = uuid.uuid4().hex
+        path = output / f"batch-upload-{ticket}.jsonl"
+        hasher = hashlib.sha256()
+        with path.open("wb") as handle:
+            for line in lines:
+                handle.write(line); hasher.update(line)
+            handle.flush(); os.fsync(handle.fileno())
+        record = {"submission_id": ticket, "state": "prepared", "input_path": path.name,
+                  "sha256": hasher.hexdigest(), "requests": [rid for rid, _ in costs], "costs": costs}
+        journal = output / "submissions" / (ticket + ".json")
+        atomic_json(journal, record)
+        del lines
+        _send_batch(record, journal, output, batches, ledger, client)
+        journals[ticket] = record
 
 
 def collect_batches(batches, packets, source, output, ledger, client, wait):
     by_id = {p["request_id"]: p for p in packets}
     while True:
+        states = _batch_states(batches, output, ledger, client)
         pending = 0
         for batch in batches:
             receipt = output / "batch-receipts" / (batch["id"] + ".json")
             if receipt.exists():
                 continue
-            status = client.call("GET", "/batches/" + batch["id"]).json()
+            status = states[batch["id"]]
             print(dumps({"event": "batch", "id": batch["id"], "status": status["status"], "counts": status.get("request_counts")}), flush=True)
             if status["status"] not in {"completed", "failed", "expired", "cancelled"}:
                 pending += 1
@@ -960,7 +1155,7 @@ def collect_batches(batches, packets, source, output, ledger, client, wait):
                                                "reason_codes": ["batch_" + status["status"], "no_returned_result"]})
             atomic_json(receipt, {"id": batch["id"], "status": status["status"], "counts": status.get("request_counts")})
         if not pending or not wait:
-            break
+            return states
         time.sleep(30)
 
 
@@ -1080,8 +1275,8 @@ def main():
         if args.mode == "regular":
             run_regular(packets, prompt, source, output, ledger, client)
         elif args.mode in {"batch", "collect"}:
-            wait_for = (lambda batches: collect_batches(batches, packets, source, output, ledger, client, True)) if args.wait else None
-            batches = submit_batches(packets, prompt, output, ledger, client, wait_for) if args.mode == "batch" else loads((output / "batches.json").read_text())
+            collect = lambda batches: collect_batches(batches, packets, source, output, ledger, client, False)
+            batches = submit_batches(packets, prompt, output, ledger, client, collect, args.wait) if args.mode == "batch" else loads((output / "batches.json").read_text())
             collect_batches(batches, packets, source, output, ledger, client, args.wait)
         if args.mode != "prepare":
             export(source, ids, output, early, ledger)

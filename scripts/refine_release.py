@@ -150,15 +150,15 @@ def retry_packets(output, originals):
 
 
 def run_stage(packets, prompt, source, output, ledger, client):
+    all_packets = packets
     def collect(batches):
-        all_packets = [loads((output / 'packets' / rid / 'input.json').read_text())
-                       for rid in loads((output / 'requests.json').read_text())]
-        collect_batches(batches, all_packets, source, output, ledger, client, True)
-    submit_batches(packets, prompt, output, ledger, client, collect)
+        return collect_batches(batches, all_packets, source, output, ledger, client, False)
+    submit_batches(packets, prompt, output, ledger, client, collect, wait=True)
     release_memory()
     retries = retry_packets(output, packets)
     if retries:
-        submit_batches(retries, prompt, output, ledger, client, collect)
+        all_packets = packets + retries
+        submit_batches(retries, prompt, output, ledger, client, collect, wait=True)
 
 
 def main():
@@ -172,8 +172,8 @@ def main():
     parser.add_argument('--env-file', type=Path, default=ROOT / '.env')
     parser.add_argument('--hf-token-file', type=Path)
     parser.add_argument('--hf-repo', default='suryadv/concor-video-data-filtered')
-    parser.add_argument('--mode', choices=['prepare', 'submit-first', 'run'], default='prepare',
-                        help='submit-first queues one NLP wave; run resumes, monitors all waves and exports')
+    parser.add_argument('--mode', choices=['prepare', 'submit', 'submit-first', 'run'], default='prepare',
+                        help='submit queues all currently admissible NLP work; run resumes, monitors both passes and exports (submit-first is a legacy alias)')
     parser.add_argument('--publish', action='store_true')
     args = parser.parse_args()
     if not 0 < args.total_budget_usd < 100:
@@ -238,8 +238,9 @@ def main():
             raise ValueError('OPENAI_API_KEY is missing')
         client = ReleaseAPIClient()
         status('nlp_batch', requests=len(packets))
-        if args.mode == 'submit-first':
-            batches = submit_batches(packets, prompts[1][1], nlp, ledger, client)
+        if args.mode in {'submit', 'submit-first'}:
+            collect = lambda batches: collect_batches(batches, packets, source, nlp, ledger, client, False)
+            batches = submit_batches(packets, prompts[1][1], nlp, ledger, client, collect)
             status('nlp_batch_queued', batches=[b['id'] for b in batches],
                    cost_upper_usd=ledger.total(), resume_mode='run')
             return
