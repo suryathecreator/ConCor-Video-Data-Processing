@@ -1,5 +1,5 @@
 ---
-version: concor-nlp-cleanup-v1
+version: concor-nlp-cleanup-v2
 model: gpt-6-luna
 reasoning_effort: medium
 metadata_only: This front matter is documentation and is NOT sent to the model.
@@ -26,6 +26,12 @@ Use meaning in context: "the building" is a noun; "they are building" is an acti
 Do not link "the screen", "the left", or "the front" when they denote framing or
 abstract directions rather than a concrete object.
 
+Do not link generic category definitions, taxonomic order/family names, or their
+parenthetical glosses. In "Which animals belong to the flightless bird order
+Sphenisciformes, specifically the family Spheniscidae (penguins)?", only "Which
+animals" refers to the intended visible instances. Leave "penguins" and the
+taxonomic names untagged. A concrete "the penguins on the left" remains referential.
+
 Repair noun-phrase boundaries to include determiners, possessives and pre-head
 attributes, excluding post-head relations, participial clauses and punctuation.
 The supplied offsets may themselves be wrong; tag literal words in the actual text.
@@ -41,7 +47,11 @@ infer absent objects, or rewrite a sentence. Invalid context links can simply be
 omitted while leaving their words untouched for the visual pass to assess. Leave
 unlinked concrete words alone when no compatible candidate group exists.
 
-For negative=true, return keep and the exact original text without any tags.
+For negative=true, trust the nonexistent-target label and leave that absent target
+untagged. Preserve the exact text. If valid context groups are supplied, tag only
+their concrete background references. If no context groups are supplied, return
+keep with the original text and no tags. Never invent segmentation: the visual
+pass will reject negative captions whose background entities lack suitable masks.
 For positive examples, return keep when links are unchanged or rewrite when links
 were repaired/removed. Never return reject. Tags must be balanced and properly
 nested; use the same ID for repeated references. No tag may wrap a verb alone.

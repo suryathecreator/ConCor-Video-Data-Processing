@@ -272,10 +272,66 @@ def test_nlp_negative_has_no_candidate_groups(tmp_path):
     original = row()
     original["negative"] = True
     original["text"] = "a dog [that is absent]"
+    original.update(groups_json='[]', tracklets_json='[]', span_links_json='[]')
     packets, _ = refine.prepare_nlp(SimpleNamespace(row=lambda _: original), ["a"],
                                    SimpleNamespace(max_tracklets=64, group_size=12), "prompt", tmp_path)
     clean = refine.apply_result(original, {"decision": "keep", "tagged_caption": original["text"]}, packets[0]["mapping"]["a"])
     assert clean["text"] == original["text"] and clean["groups_json"] == clean["tracklets_json"] == "[]"
+
+
+def crowded_row(count):
+    original = row()
+    tracks = [{'tracklet_id': 'target', 'masks': [{'size': [4, 4], 'counts': [0, 1, 15]}, None]}]
+    groups = [json.loads(original['groups_json'])[0]]
+    for i in range(1, count + 1):
+        tid = f'context-{i}'
+        tracks.append({'tracklet_id': tid, 'masks': [{'size': [4, 4], 'counts': [i, 1, 15-i]}, None]})
+        groups.append({'group_id': tid, 'role': 'context_entity', 'identity': 'dog', 'tracklet_ids': [tid],
+                       'text_spans': [{'start': 11, 'end': 16, 'text': 'a dog'}]})
+    original.update(tracklets_json=json.dumps(tracks), groups_json=json.dumps(groups))
+    return original
+
+
+def test_entity_ceiling_counts_union_across_groups_not_total_scene_tracks():
+    assert refine.inspect_row(crowded_row(10), 64)[1] is None
+    assert refine.inspect_row(crowded_row(11), 64)[1] == 'excessive_entity_link'
+    # The unrestricted original view is human evidence only.
+    assert refine.inspect_row(crowded_row(11), 64, None)[1] is None
+    original = crowded_row(11)
+    tracks = json.loads(original['tracklets_json'])
+    tracks[-1]['masks'] = tracks[-2]['masks']
+    original['tracklets_json'] = json.dumps(tracks)
+    assert refine.inspect_row(original, 64)[1] is None
+
+
+def test_final_output_cannot_create_overfull_collective_link():
+    original = crowded_row(11)
+    mapping = {'visual_to_local': {i: t['tracklet_id'] for i, t in enumerate(json.loads(original['tracklets_json']), 1)}, 'main_ids': [1]}
+    tagged = ''.join(f'[{i}]' for i in range(1,13)) + 'the dogs' + ''.join(f'[/{i}]' for i in range(12,0,-1))
+    with pytest.raises(ValueError, match='excessive_entity_link'):
+        refine.apply_result(original, {'decision': 'rewrite', 'tagged_caption': tagged}, mapping)
+
+
+def test_negative_can_keep_segmented_context_but_never_a_target(tmp_path):
+    original = row()
+    original.update(negative=True, text='a fox near a dog')
+    group = json.loads(original['groups_json'])[1]
+    group['text_spans'] = [{'start': 11, 'end': 16, 'text': 'a dog'}]
+    original['groups_json'] = json.dumps([group])
+    packets, early = refine.prepare_nlp(SimpleNamespace(row=lambda _: original), ['a'],
+                                       SimpleNamespace(max_tracklets=64, group_size=12), 'prompt', tmp_path)
+    assert not early
+    mapping = packets[0]['mapping']['a']
+    assert mapping['main_ids'] == []
+    clean = refine.apply_result(original, {'decision': 'keep', 'tagged_caption': 'a fox near [1]a dog[/1]'}, mapping)
+    result = refine.apply_result(clean, {'decision': 'keep', 'tagged_caption': 'a fox near [2]a dog[/2]'},
+                                 {'visual_to_local': {2: 'context'}, 'main_ids': []})
+    assert result['negative'] and result['disposition'] == 'negative_with_context'
+    assert all(g['role'] == 'context_entity' for g in json.loads(result['groups_json']))
+    assert json.loads(result['span_links_json'])[0]['text'] == 'a dog'
+    with pytest.raises(ValueError, match='exact original'):
+        refine.apply_result(clean, {'decision': 'rewrite', 'tagged_caption': '[2]A dog[/2]'},
+                            {'visual_to_local': {2: 'context'}, 'main_ids': []})
 
 
 def test_density_sample_has_exact_video_quotas_and_featured_within_200(monkeypatch):
@@ -398,3 +454,133 @@ def test_interruption_recovery_never_bypasses_budget_or_retries_forever(tmp_path
         refine.run_regular([packet], "prompt", SimpleNamespace(row=row), tmp_path, ledger, SimpleNamespace(call=call), recover_interrupted=True)
     assert ledger.total() == (.2 if already_interrupted else .1)
     ledger.db.close()
+
+
+def test_publication_renames_losslessly_and_exposes_native_links(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from publish_refined_hf import COLUMNS, public_table
+    original = row()
+    original = {key: original.get(key, '') for key in COLUMNS}
+    source = pa.Table.from_pylist([original])
+    public = public_table(source, {'a': 'rewrite'})
+    for old, new in COLUMNS.items():
+        assert public[new].equals(source[old])
+    value = public.to_pylist()[0]
+    assert value['caption'] == original['text']
+    assert value['object_count'] == 2
+    assert value['caption_links'][0] == {'start': 0, 'end': 5, 'text': 'a dog', 'object_ids': ['target']}
+    assert value['frame_ids'] == ['00000', '00001']
+
+
+def test_hf_card_keeps_existing_configs_and_replaces_only_owned_section(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from publish_refined_hf import update_card
+    import yaml
+    original = '---\nlicense: other\nconfigs:\n- config_name: original\n  data_files: old.parquet\n---\nOriginal instructions.\n'
+    manifest = {'retained_rows': 5, 'source_rows': 6}
+    once = update_card(original, [], manifest)
+    twice = update_card(once, [], manifest)
+    header = yaml.safe_load(twice[4:].split('\n---', 1)[0])
+    assert header['license'] == 'other'
+    assert header['configs'][0] == {'config_name': 'original', 'data_files': 'old.parquet'}
+    assert [c['config_name'] for c in header['configs']] == ['original', 'gpt_refined']
+    assert twice.count('## GPT-refined training data') == 1
+    assert 'Original instructions.' in twice
+
+
+def test_hf_card_explicitly_preserves_original_and_verified_parquets(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from publish_refined_hf import update_card
+    import yaml
+    card = update_card('---\nlanguage: en\n---\nSource data.', ['eval/filtered/verified.parquet'],
+                       {'retained_rows': 5, 'source_rows': 6})
+    metadata = yaml.safe_load(card[4:].split('\n---', 1)[0])
+    assert {d['path'] for d in metadata['configs'][0]['data_files']} == {
+        'train/verification.parquet', 'eval/unfiltered/verification.parquet', 'eval/filtered/verified.parquet'}
+
+
+def test_publication_refuses_incomplete_audit(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from publish_refined_hf import prepare_publication
+    refine.atomic_json(tmp_path / 'summary.json', {'complete': False, 'counts': {'pending': 1}})
+    with pytest.raises(ValueError, match='incomplete'):
+        prepare_publication(tmp_path)
+
+
+def test_batch_retry_excludes_valid_and_uncertain_results(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from refine_release import retry_packets
+    packet = recovery_packet()
+    packet['mapping']['b'] = MAPPING
+    packet['packet']['expressions'].append({'sample_id': 'b', 'allowed_ids': [1, 2]})
+    refine.atomic_json(tmp_path / 'requests.json', ['interrupted'])
+    refine.atomic_json(tmp_path / 'packets/interrupted/input.json', packet)
+    for sid, decision in [('a', 'error'), ('b', 'keep')]:
+        refine.atomic_json(tmp_path / 'decisions' / (refine.digest(sid) + '.json'),
+                           {'decision': decision, 'reason_codes': ['invalid_tag']})
+    assert retry_packets(tmp_path, [packet]) == []  # no response: charge uncertain
+    refine.atomic_json(tmp_path / 'packets/interrupted/response.json', {'status': 'completed'})
+    retry = retry_packets(tmp_path, [packet])
+    assert len(retry) == 1 and set(retry[0]['mapping']) == {'a'}
+    assert [e['sample_id'] for e in retry[0]['packet']['expressions']] == ['a']
+    assert retry_packets(tmp_path, [packet]) == retry  # stable IDs on resume
+
+
+def test_release_retries_reads_but_never_uncertain_submissions(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    import refine_release as release
+    attempts = []
+    def failed_call(self, method, endpoint, **kwargs):
+        attempts.append(method)
+        if len(attempts) < 3: raise release.requests.Timeout('fixture')
+        return 'done'
+    monkeypatch.setattr(release.APIClient, 'call', failed_call)
+    monkeypatch.setattr(release.time, 'sleep', lambda _: None)
+    client = object.__new__(release.ReleaseAPIClient)
+    assert client.call('GET', '/batches/fixture') == 'done'
+    assert attempts == ['GET'] * 3
+    attempts.clear()
+    with pytest.raises(release.requests.Timeout): client.call('POST', '/batches')
+    assert attempts == ['POST']
+
+
+def test_release_estimate_includes_prior_charges_and_batch_margin(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from refine_release import estimate_release
+    source_row = row()
+    source_row.update(dataset='revos', split='train')
+    source = SimpleNamespace(rows={'a': source_row, 'b': source_row})
+    refine.atomic_json(tmp_path / 'summary.json', {'complete': True})
+    refine.atomic_json(tmp_path / 'run.json', {'selected_ids': ['a'],
+        'prompt_sha256': refine.digest(refine.read_prompt(ROOT / 'prompts/video_refinement.md')[1]),
+        'nlp_prompt_sha256': refine.digest(refine.read_prompt(ROOT / 'prompts/nlp_cleanup.md')[1])})
+    refine.atomic_json(tmp_path / 'selection.json', {'videos': [{'sample_ids': ['a'], 'dataset': 'revos', 'density_bin': '0–2'}]})
+    ledger = refine.Ledger(tmp_path / 'budget.sqlite', 1.)
+    ledger.reserve('n', .02); ledger.settle('n', .02)
+    ledger.reserve('v', .08); ledger.settle('v', .08); ledger.db.close()
+    for folder, rid in [(tmp_path / 'nlp', 'n'), (tmp_path, 'v')]:
+        refine.atomic_json(folder / 'requests.json', [rid])
+        refine.atomic_json(folder / 'packets' / rid / 'input.json', {'mapping': {'a': {}}})
+    estimate = estimate_release(source, tmp_path, .5)
+    assert estimate['expected_batch_usd'] == pytest.approx(.1)
+    assert estimate['buffered_total_usd'] == pytest.approx(.65)
+    refine.atomic_json(tmp_path / 'summary.json', {'complete': False})
+    with pytest.raises(ValueError, match='complete'): estimate_release(source, tmp_path, .5)
+
+
+def test_publication_export_covers_every_input_and_only_training(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from publish_refined_hf import COLUMNS, prepare_publication
+    original = {key: row().get(key, '') for key in COLUMNS}
+    original['split'] = 'train'
+    pq.write_table(pa.Table.from_pylist([original]), tmp_path / 'train.parquet')
+    refine.atomic_json(tmp_path / 'summary.json', {'complete': True, 'selected': 2, 'counts': {'keep': 1, 'reject': 1}})
+    refine.atomic_json(tmp_path / 'audit.json', [{'sample_id': 'a', 'decision': 'keep'}, {'sample_id': 'b', 'decision': 'reject'}])
+    refine.atomic_json(tmp_path / 'run.json', {'selected_ids': ['a', 'b'], 'prompt_sha256': 'p', 'nlp_prompt_sha256': 'n'})
+    destination, files, manifest = prepare_publication(tmp_path)
+    assert manifest['retained_rows'] == 1 and manifest['source_rows'] == 2
+    table = pq.read_table(destination / 'gpt_refined/train/train-00000.parquet')
+    assert table['object_tracks_json'].to_pylist() == [original['tracklets_json']]
+    assert table['refinement_decision'].to_pylist() == ['keep']
+    refine.atomic_json(tmp_path / 'audit.json', [{'sample_id': 'a', 'decision': 'keep'}])
+    with pytest.raises(ValueError, match='every selected'): prepare_publication(tmp_path)

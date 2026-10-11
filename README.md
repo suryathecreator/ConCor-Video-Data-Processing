@@ -99,7 +99,7 @@ For one custom split, use scripts/submit_slurm.sh. Change SLURM_PARTITION, SLURM
 7. Atomically checkpoint each instruction and export flat tables, a complete ledger, and one verifier-ready Parquet.
 8. **Push the generated data to Hugging Face first.** Then optionally run the API refinement below on a downloaded HF snapshot plus local media. This stage is **optional for generation, required for our higher-quality release**. Inspect its pilot before publishing refined split Parquets.
 
-Nonexistent ReVOS descriptions are preserved as intentional zero-tracklet negatives.
+Nonexistent ReVOS descriptions preserve the intentionally absent target; valid segmented context may retain its own links during refinement.
 
 ## Optional API refinement after HF upload
 
@@ -111,7 +111,9 @@ Visual presentation follows VIPOSeg: original frame on the left, colored masks a
 
 Up to **12 expressions from one dataset/split/video** share their images and tracklet inventory. Only exactly equal complete frame-aligned mask sequences share a visual ID. Each expression keeps its own allowed IDs and intended target, enforced in the response schema and local validation. Groups split above 24 distinct candidate tracks instead of making objects smaller. One severely noisy expression with more than 64 nonempty, distinct tracks is rejected by the configurable cheap filter. Invalid mask sequences, missing main tracks and empty main tracks are also rejected; empty context tracks and exact duplicates are removed. Similar-looking or high-IoU tracks are never merged by this wrapper.
 
-One reasoning call chooses relevant context, repairs missing correspondences, rewrites the caption when needed, or rejects an irreparable sample. Balanced inline tags become exact Unicode character spans locally, then both BCC directions are rebuilt and checked. Every retained positive keeps its intended main track(s). Intentional ReVOS negatives retain their exact original text and no links unless rejected for clear contradictory evidence. Regular mode retries a structurally invalid model result once, using the same evidence and only the affected expressions; this is not a separate audit stage. Persistent validation/API/media failures remain errors, distinct from semantic rejection.
+One visual reasoning call chooses relevant context, repairs missing correspondences, rewrites the caption when needed, or rejects an irreparable sample. Balanced inline tags become exact Unicode character spans locally, then both BCC directions are rebuilt and checked. Every retained positive keeps its intended main track(s). Intentional nonexistent targets are **accepted by default**, preserving the exact caption and no target links. Visual resemblance does not override the negative label. Reject a negative only when its caption includes concrete context/background entities without valid supplied masks; segmented context may retain links. Regular mode and the two-pass release wrapper allow one validation retry for affected expressions only. Persistent validation/API/media failures remain errors, distinct from semantic rejection.
+
+Release rules: **reject an entire example if one entity mention links to more than 10 distinct nonempty tracks**, including unions across fragmented groups. Exactly 10 is allowed; the limit is per entity, not per scene. Do not rescue an overfull flower/object group by selecting a smaller subset. Taxonomy and explanatory glosses are not extra referential mentions: in the flightless-bird question, link “Which animals,” leaving “Sphenisciformes,” “Spheniscidae,” and “(penguins)” unhighlighted. Positive captions omit concrete unsegmented background entities: a fox/dog caption cannot add “through the snow” without a supplied snow mask.
 
 Manual observation from earlier dataset inspection: **Ref-YouTube-VOS more often has problematic context links; ReVOS is generally better but includes severe anomalies.** These observations motivate review; they are not a measured quality ranking. Model refinement and a 20-expression pilot also do not prove the entire release correct.
 
@@ -148,8 +150,9 @@ the penguin example separately in the viewer.
    each video. Videos without a local source archive/frame folder are excluded
    before sampling and counted in `selection.json`. This is a density stress sample, not a verified count of
    real objects or a random estimate of corpus error rates.
-2. Apply the existing structural checks, remove empty context, and deduplicate
-   exactly equal mask sequences. Structural failures remain visible as rejections.
+2. Apply structural checks, remove empty context, deduplicate exactly equal mask
+   sequences, and reject entity links with more than 10 distinct tracks.
+   Structural failures remain visible as rejections with original audit images.
 3. Run a **text-only GPT-6 Luna / medium** pass using
    [`prompts/nlp_cleanup.md`](prompts/nlp_cleanup.md). Preserve every original
    character and the intended target; repair noun boundaries and remove bogus
@@ -217,7 +220,7 @@ from **35 → 27 → 2 tracks**: NLP removes eight face candidates incorrectly l
 to “facing,” then visual refinement retains the target and neighboring penguin.
 
 The [hosted review viewer](https://concor-video-refinement-pilot.daisydv.chatgpt.site)
-is public and shows all 200 outcomes, including the failed proposal. Click any
+is public and shows all 200 outcomes from the latest completed review. Click any
 caption to show only its linked masks; click a colored span to isolate its BCC
 link, or an ID chip to isolate one mask. Caption selection switches to the
 matching before/after-NLP evidence. Click elsewhere or press Escape to restore
@@ -227,36 +230,50 @@ Conservative run cost is
 local memory-limit kill; their replacements were charged separately. Including
 the earlier $0.02981 pilot, the conservative total is **$0.681738**. Checkpoints
 and reservations are preserved. These are review results, not a measured accuracy
-score or a full-corpus release; HF remains unchanged.
+score or a full-corpus release; that review did not change HF.
 
-### Full-corpus commands (not part of the 200-video review)
+Revised **2026-10-11**, using the same 200 expressions in
+`outputs/luna-policy-v2-review-20261011`: **131 rewrites, 24 keeps, 45 rejections,
+zero unresolved errors**. The stricter structural rules reject 37 before paid
+review; NLP repairs 50 of the remaining 163 and removes 46 candidate tracks.
+“(penguins)” remains unhighlighted in the taxonomy question, the fox/dog caption
+omits unsupported snow, and the nonexistent car is kept unchanged without links.
+The featured `003234408d` now fails the 10-track rule because “another penguin”
+has 26 distinct tracks; its original masks remain inspectable. This review costs
+**$0.466745**, bringing all review charges and outstanding earlier reservations to
+**$1.148482**. The density-weighted training Batch estimate is **$53.32**, or
+**$87.75 total including prior spending and the uncertainty/safety margin**;
+the release ledger caps the aggregate at **$99**. These are cost projections,
+not a promised final price or a measured semantic accuracy score.
 
-Prepare inputs and inspect the conservative reservation before submitting:
+### Full training release with automatic HF publication
 
-~~~bash
-python scripts/refine_hf.py \
-  --input data/hf --media-root /data/concor-video \
-  --output outputs/luna-full --mode prepare --budget-usd 95
-
-python scripts/refine_hf.py \
-  --input data/hf --media-root /data/concor-video \
-  --output outputs/luna-full --mode batch --budget-usd 95 --wait
-~~~
-
-The original $5 pilot / $95 full-run split was a planning allowance. After any additional pilot, subtract **all** actual charges and outstanding reservations from the $100 total before choosing a full-run allowance. Each output directory has a durable reservation ledger. Pending/uncertain charges continue counting against it. A preflight above the allowance sends no requests; reaching the limit preserves pending work, never labels it bad data. A reservation is conservative, not an OpenAI account spending limit: keep prices current and do not bypass the ledger by copying runs. After a submission/network interruption, collect known batches before investigating unresolved reservations; the script refuses to blindly repeat potentially billed calls.
-
-Pricing checked 2026-10-07: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) costs $0.10 input / $0.50 output per million standard tokens ($0.125 cache writes; $0.01 cache hits); [Batch](https://developers.openai.com/api/docs/guides/batch) halves those rates and has a 24-hour completion window. The ledger includes reasoning output, reserves the output ceiling, assumes no cache hits, accounts for cache writes and long-context premiums, and settles from returned usage. Image billing estimates deliberately overestimate patch tokens. Input rendering time and your account's Batch queue limit also affect ETA; multiple queue waves can take longer than 24 hours. Shared evidence reduces cost without lowering the requested model or visual resolution.
-
-To resume Batch collection without preparing frames again:
+[`scripts/refine_release.py`](scripts/refine_release.py) processes **only the training Parquet**, through both NLP and visual passes. The separate sample wrapper remains capped at 200 videos. A completed review using the same prompts is required before any full-run API submission. The estimate weights measured review costs by dataset and candidate-density range, applies the Batch discount, adds two standard errors and a 50% margin, and takes no credit for sharing full-run visual requests. It is a reasonable estimate, not a quote; the durable ledger independently caps reservations and charges below $100, including all supplied prior ledgers.
 
 ~~~bash
-python scripts/refine_hf.py --input data/hf --output outputs/luna-full \
-  --mode collect --budget-usd 95 --wait
+python scripts/refine_release.py \
+  --input data/hf/train/verification.parquet --media-root /data/concor-video \
+  --output outputs/luna-training-v2 --pilot-run outputs/luna-policy-v2-review-20261011 \
+  --prior-ledger outputs/luna-pilot-20261007/budget.sqlite \
+  --prior-ledger outputs/luna-density-200-20261010-available/budget.sqlite \
+  --total-budget-usd 99 --mode prepare
+
+# Repeat the same arguments with --mode run --publish.
+# Credentials are read from .env (OPENAI_API_KEY / HF_TOKEN), HF's token cache,
+# or --hf-token-file /path/to/a/local/credential. Never put tokens in arguments.
 ~~~
 
-Batch files stay below 180 MB and a conservative 16-million-input-token bound. `--wait` submits and collects one wave at a time; without it, `--mode batch` submits one wave, then a later `collect` downloads its results. Run `batch` again to submit remaining waves. Do not switch a run between regular and Batch billing modes. Check your account's actual queue allowance before a full run.
+`--mode run` submits bounded Batch waves and waits/collects them automatically, then repeats for the visual pass. Run it in a durable terminal or scheduler job using `slurm/refine_release.slurm`. Optional `--mode submit-first` queues the first NLP Batch wave immediately and exits; the scheduled `--mode run` resumes and monitors it without duplicate charges. Resume with the exact same command and output directory; requests, responses, batch IDs, cost reservations, and status checkpoints are preserved. `status.json`, `estimate.json`, `summary.json`, and `publication.json` record progress and the verified HF commit. Uncertain charges remain reserved. A stopped run never mislabels pending examples as rejections and never publishes partial training output. Review/export errors require recovery before publication.
 
-Outputs are **`train.parquet`, `val.parquet`, `test.parquet`** as applicable, with the **same column order, Arrow types and schema metadata as the input**. Dataset identity remains in each row. Kept/rewritten rows retain `sample_id`, frame lists, full retained mask sequences and original extraction/SAM provenance; only `text`, `tracklets_json`, `groups_json`, `span_links_json` and `disposition` can change. Rejected rows are omitted. Empty splits still have the original schema. Check `summary.json` for `complete: true` before publishing: error/pending rows are omitted from partial exports, with their status retained in `audit.json`. Per-request manifests, raw model responses and decisions are local sidecars, not extra HF columns. No command uploads refined annotations to HF automatically.
+With `--publish`, [`scripts/publish_refined_hf.py`](scripts/publish_refined_hf.py) adds **`gpt_refined` → `train`** to `suryadv/concor-video-data-filtered` in one atomic commit. It preserves existing annotations and card content, documents both processing passes and limitations, and uploads prompts and per-expression decisions. All 22 source fields are retained under readable names (including `caption`, `is_nonexistent`, `source_dataset`, `object_tracks_json`, `text_entities_json`, and `caption_object_links_json`). Native `frame_ids` and `caption_links`, object/phrase counts, and `refinement_decision` make browsing easier. Full mask JSON is retained exactly. The processing manifest gives the complete column mapping. A write-enabled HF credential is required; credentials are never uploaded.
+
+The original $5 pilot / $95 full-run split was a planning allowance. Include **all** prior actual charges and outstanding reservations; the current review ledger is included automatically. A reservation is conservative, not an OpenAI account spending limit: keep prices current and do not bypass the ledger by copying runs. After a submission/network interruption, collect known batches before investigating unresolved reservations; the script refuses to blindly repeat potentially billed calls.
+
+Pricing checked 2026-10-11: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) costs $0.10 input / $0.50 output per million standard tokens ($0.125 cache writes; $0.01 cache hits); [Batch](https://developers.openai.com/api/docs/guides/batch) halves those rates and has a 24-hour completion window. The ledger includes reasoning output, reserves the output ceiling, assumes no cache hits, accounts for cache writes and long-context premiums, and settles from returned usage. Image billing estimates deliberately overestimate patch tokens. Input rendering time and your account's Batch queue limit also affect ETA; multiple queue waves can take longer than 24 hours. Shared evidence reduces cost without lowering the requested model or visual resolution.
+
+Batch files stay below 180 MB and a conservative 16-million-input-token bound. The release wrapper submits and collects one wave at a time; waves may extend beyond a single 24-hour window. Keep the same output directory to resume. The lower-level `refine_hf.py` still supports standalone visual-only `batch`, `collect`, and `--wait` workflows; use `refine_release.py` for the required two-pass training release.
+
+Outputs are **`train.parquet`, `val.parquet`, `test.parquet`** as applicable, with the **same column order, Arrow types and schema metadata as the input**. Dataset identity remains in each row. Kept/rewritten rows retain `sample_id`, frame lists, full retained mask sequences and original extraction/SAM provenance; only `text`, `tracklets_json`, `groups_json`, `span_links_json` and `disposition` can change. Rejected rows are omitted. Empty splits still have the original schema. Check `summary.json` for `complete: true` before publishing: error/pending rows are omitted from partial exports, with their status retained in `audit.json`. Per-request manifests and raw model responses stay local. The release publisher adds readable columns and separate public processing audits only after the complete training run passes validation.
 
 ### Inspect the pilot in a browser
 

@@ -1,5 +1,5 @@
 ---
-version: concor-video-refinement-v1
+version: concor-video-refinement-v2
 model: gpt-6-luna
 reasoning_effort: medium
 metadata_only: This front matter is documentation and is NOT sent to the model.
@@ -98,13 +98,47 @@ its own allowed_ids. Never mix results or main referents between expressions.
     allowed tracks. Countable trees, rocks, clouds and mountains follow instance rules.
     Do not enumerate irrelevant background entities to increase coverage.
 
+## Release rules (apply to every expression)
+
+20. Ground references to particular visible instances, not generic class definitions,
+    taxonomic names, or explanatory category glosses. In "Which animals belong to
+    the flightless bird order Sphenisciformes, specifically the family Spheniscidae
+    (penguins)?", link "Which animals" to the intended animals. Do NOT tag
+    "penguins", the order, or the family: those describe a taxonomic category and
+    do not introduce another reference to the individual animals. Ordinary concrete
+    mentions such as "the penguins on the left" still require appropriate links.
+21. Never use an unsegmented background entity in a positive caption. This includes
+    snow, grass, ground, water, roads, sky, buildings, and incidental scene details.
+    A visible background is not automatically a permitted mask. Remove unsupported
+    background phrases and dependent relations; do not invent a link to the target.
+    With only fox and dog masks, "A fox lies beside a dog" is acceptable, but adding
+    "through the snow" is not. Omit the snow unless a suitable snow mask is supplied.
+    Reject if removing unsupported context would destroy the intended target.
+22. Reject the ENTIRE example if any single entity mention or candidate entity group
+    has more than 10 distinct nonempty mask tracks attached to it. Count the union
+    across groups sharing that mention. This is a reliability rule for SAM 3.1,
+    including apparently plausible collectives such as "white flowers": many masks
+    do not establish that every flower was correctly segmented. Do not evade this
+    rule by deleting the phrase, choosing ten of its candidates, or splitting it
+    into artificial mentions. The limit is per entity link, not total scene density.
+    Exactly 10 is allowed. Use reason_code excessive_entity_link.
+
 ## Intentional negative examples
 
-If negative is true, the source is an intentional nonexistent-object example. Preserve
-its original text, return keep with no tags, and do not create a positive target or
-context links. Only reject it when sampled evidence clearly contradicts the intended
-negative. A negative noun phrase is not an unlinked-positive-entity error. Absence from
-sparse sampled frames alone cannot establish absence throughout the full video.
+If negative is true, TRUST the source's nonexistent-target designation. ACCEPT it by
+default; do not reject because sampled pixels appear to contain a similar object.
+Preserve the exact original text and keep the nonexistent target UNTAGGED. Do not
+invent a positive target. Usually allowed_ids is empty and the correct output is
+keep with the original text and no tags (e.g. "the car about to turn left").
+
+The exception is a separately referenced, concrete background/context entity. A
+negative "a fox beside a dog" still refers to a dog besides the nonexistent fox.
+ACCEPT only if every such context entity has compatible supplied segmentation and
+tag those context mentions only. If any background/context entity in the caption
+cannot be segmented with the permitted tracks, REJECT with unsegmented_negative_context.
+Do not delete its words to rescue it. Abstract directions, actions, taxonomic class
+definitions and attributes of the absent target are not background entities.
+The more-than-10-masks rule still applies to any segmented context link.
 
 ## Final response
 

@@ -99,12 +99,14 @@ def validate_record(record: dict[str, Any]) -> None:
     expected = rebuild_span_links(record.get("groups", []))
     if record.get("span_links") != expected:
         raise ValueError("span_links is not the canonical inverse of groups")
-    if record.get("negative") and (tracklets or record.get("groups")):
-        raise ValueError("negative/nonexistent record must not contain tracklets")
     disposition = record.get("disposition")
-    if record.get("negative") and disposition != "negative_unsegmentable":
-        raise ValueError("negative record has the wrong disposition")
+    if record.get('negative'):
+        expected_disposition = 'negative_with_context' if tracklets else 'negative_unsegmentable'
+        if disposition != expected_disposition:
+            raise ValueError('negative record has the wrong disposition')
+        if any(g.get('role') != 'context_entity' for g in record.get('groups', [])):
+            raise ValueError('negative record may contain only segmented context, never a target')
     if not record.get("negative") and not tracklets and disposition != "missing_main_referent":
         raise ValueError("positive record without tracklets must be a missing main referent")
-    if tracklets and not any(group.get("role") == "main_referent" for group in record["groups"]):
+    if tracklets and not record.get('negative') and not any(group.get("role") == "main_referent" for group in record["groups"]):
         raise ValueError("positive tracklets require a main_referent group")

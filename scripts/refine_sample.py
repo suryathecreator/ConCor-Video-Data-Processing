@@ -214,7 +214,10 @@ def main():
         if (preflight_dir / "requests.json").exists():
             originals = load_packets(preflight_dir)
         else:
-            originals, _ = prepare(source, ids, args, prompt, preflight_dir)
+            # Human audit retains the original noisy candidates, including cases
+            # rejected by the per-entity ceiling before any paid call.
+            audit_args = SimpleNamespace(**vars(args), max_entity_tracks=None)
+            originals, _ = prepare(source, ids, audit_args, prompt, preflight_dir)
         # Include the one allowed retry for every request, even though uncommon.
         bound = 2 * (sum(estimated_max_cost(p, nlp_prompt) for p in nlp_packets) +
                      sum(estimated_max_cost(p, prompt) for p in originals))

@@ -38,7 +38,8 @@ from concor_video.tracklet_schema import SCHEMA_VERSION, rebuild_span_links, val
 from concor_video.verification import VerificationState, _candidate_media_sources
 
 MODEL = "gpt-6-luna"
-VERSION = "concor-refine-v1"
+VERSION = "concor-refine-v2"
+MAX_ENTITY_TRACKS = 10
 API = "https://api.openai.com/v1"
 META = ["sample_id", "dataset", "split", "video_id", "cohort", "text", "negative", "groups_json", "disposition"]
 TAG = re.compile(r"\[(/?)([1-9][0-9]*)\]")
@@ -204,16 +205,18 @@ def visible_indices(track):
             if mask and sum(mask["counts"][1::2]) > 0]
 
 
-def inspect_row(row, max_tracks):
+def inspect_row(row, max_tracks, max_entity_tracks=MAX_ENTITY_TRACKS):
     """Only inexpensive structural/noise checks; no language guessing or IoU merge."""
     frames = loads(row["frame_ids_json"], [])
     tracks = loads(row["tracklets_json"], [])
     if not frames or len(set(frames)) != len(frames):
         return None, "invalid_frame_sequence"
+    mains = set() if row["negative"] else main_ids(row)
     if row["negative"]:
-        return ([], {}), None
-    mains = main_ids(row)
-    if not mains:
+        context_ids = {tid for g in loads(row['groups_json'], []) if g.get('role') == 'context_entity'
+                       for tid in g.get('tracklet_ids', [])} - main_ids(row)
+        tracks = [t for t in tracks if t['tracklet_id'] in context_ids]
+    if not row["negative"] and not mains:
         return None, "missing_main_referent"
     seen_ids, seen_masks, kept, aliases = set(), {}, [], {}
     # Prefer the original main track when an exact duplicate context track exists.
@@ -244,7 +247,23 @@ def inspect_row(row, max_tracks):
         return None, "missing_main_referent"
     if len(kept) > max_tracks:
         return None, "excessive_tracklets"
+    if max_entity_tracks is not None and excessive_entity_link(row, kept, aliases, max_entity_tracks):
+        return None, "excessive_entity_link"
     return (kept, aliases), None
+
+
+def excessive_entity_link(row, tracks, aliases, limit=MAX_ENTITY_TRACKS):
+    """Count distinct nonempty full tracks per mention, across fragmented groups."""
+    allowed = {t['tracklet_id'] for t in tracks}
+    mentions = defaultdict(set)
+    for group in loads(row['groups_json'], []):
+        ids = {aliases.get(t, t) for t in group.get('tracklet_ids', [])} & allowed
+        if len(ids) > limit:
+            return True
+        for span in group.get('text_spans', []):
+            key = (span.get('start'), span.get('end'), span.get('text'))
+            mentions[key].update(ids)
+    return any(len(ids) > limit for ids in mentions.values())
 
 
 def sample_frames(frame_count, tracks, count=12):
@@ -382,15 +401,15 @@ def apply_result(row, result, mapping):
         if result["tagged_caption"]:
             raise ValueError("rejected result must have empty caption")
         return None
-    if row["negative"]:
-        if result["decision"] != "keep" or result["tagged_caption"] != row["text"]:
-            raise ValueError("intentional negative must retain its exact original text")
+    if row["negative"] and result["tagged_caption"] == row["text"]:
         output = dict(row)
         output.update(tracklets_json="[]", groups_json="[]", span_links_json="[]", disposition="negative_unsegmentable")
         return output
     visual_to_local = {int(k): v for k, v in mapping["visual_to_local"].items()}
     text, mentions = parse_tags(result["tagged_caption"], set(visual_to_local))
-    if not set(mapping["main_ids"]).issubset(mentions):
+    if row['negative'] and text != row['text']:
+        raise ValueError('intentional negative must retain its exact original text')
+    if not row['negative'] and not set(mapping["main_ids"]).issubset(mentions):
         raise ValueError("final expression dropped the intended main referent")
     tracks = {t["tracklet_id"]: t for t in loads(row["tracklets_json"], [])}
     old_groups = loads(row["groups_json"], [])
@@ -407,13 +426,16 @@ def apply_result(row, result, mapping):
             "text_spans": [{"start": a, "end": b, "text": text[a:b]} for a, b in sorted(spans)],
         })
     links = rebuild_span_links(groups)
-    record = {"schema_version": SCHEMA_VERSION, "text": text, "negative": False,
+    if any(len(link['tracklet_ids']) > MAX_ENTITY_TRACKS for link in links):
+        raise ValueError('excessive_entity_link')
+    disposition = ('negative_with_context' if retained else 'negative_unsegmentable') if row['negative'] else 'complete_bcc'
+    record = {"schema_version": SCHEMA_VERSION, "text": text, "negative": row['negative'],
               "frame_ids": loads(row["frame_ids_json"]), "frame_files": loads(row.get("frame_files_json"), []),
-              "tracklets": retained, "groups": groups, "span_links": links, "disposition": "complete_bcc"}
+              "tracklets": retained, "groups": groups, "span_links": links, "disposition": disposition}
     validate_record(record)
     output = dict(row)
     output.update(text=text, tracklets_json=dumps(retained), groups_json=dumps(groups),
-                  span_links_json=dumps(links), disposition="complete_bcc")
+                  span_links_json=dumps(links), disposition=disposition)
     # Extraction/SAM fields intentionally remain the provenance of the source run.
     # Refinement decisions belong in the sidecar, not in extra Parquet columns.
     return output
@@ -423,9 +445,7 @@ def apply_nlp_result(row, result, mapping):
     """Repair language links without choosing among an entity's mask candidates."""
     if result["decision"] not in {"keep", "rewrite"}:
         raise ValueError("text-only cleanup cannot semantically reject an example")
-    if row["negative"]:
-        if result["decision"] != "keep" or result["tagged_caption"] != row["text"]:
-            raise ValueError("NLP cleanup must preserve intentional negatives without links")
+    if row["negative"] and result['tagged_caption'] == row['text']:
         output = dict(row)
         output.update(groups_json="[]", span_links_json="[]", tracklets_json="[]")
         return output
@@ -433,7 +453,7 @@ def apply_nlp_result(row, result, mapping):
     text, mentions = parse_tags(result["tagged_caption"], set(groups_by_id))
     if text != row["text"]:
         raise ValueError("NLP cleanup must preserve the exact original text")
-    if not set(mapping["main_ids"]).issubset(mentions):
+    if not row['negative'] and not set(mapping["main_ids"]).issubset(mentions):
         raise ValueError("NLP cleanup dropped the intended main referent")
     groups = []
     for gid, spans in sorted(mentions.items()):
@@ -451,7 +471,9 @@ def apply_nlp_result(row, result, mapping):
 def prepare_nlp(source, ids, args, prompt, output):
     """Text-only packets merge identical linguistic groups, never mask instances."""
     packets, early, entries, mappings = [], {}, [], {}
-    for sid in ids:
+    for number, sid in enumerate(ids):
+        if number and number % 64 == 0:
+            release_memory()
         row = source.row(sid)
         inspection, reason = inspect_row(row, args.max_tracklets)
         if reason:
@@ -461,15 +483,16 @@ def prepare_nlp(source, ids, args, prompt, output):
         kept, aliases = inspection
         allowed = {t["tracklet_id"] for t in kept}
         merged = {}
-        if not row["negative"]:
-            for group in loads(row["groups_json"], []):
-                tids = {aliases.get(t, t) for t in group.get("tracklet_ids", [])} & allowed
-                if not tids:
-                    continue
-                signature = digest([group.get("role"), group.get("identity"), group.get("text_spans", [])])
-                if signature not in merged:
-                    merged[signature] = {**deepcopy(group), "tracklet_ids": []}
-                merged[signature]["tracklet_ids"] = sorted(set(merged[signature]["tracklet_ids"]) | tids)
+        for group in loads(row["groups_json"], []):
+            if row['negative'] and group.get('role') != 'context_entity':
+                continue
+            tids = {aliases.get(t, t) for t in group.get("tracklet_ids", [])} & allowed
+            if not tids:
+                continue
+            signature = digest([group.get("role"), group.get("identity"), group.get("text_spans", [])])
+            if signature not in merged:
+                merged[signature] = {**deepcopy(group), "tracklet_ids": []}
+            merged[signature]["tracklet_ids"] = sorted(set(merged[signature]["tracklet_ids"]) | tids)
         groups = {i: {**g, "group_id": f"nlp-{i:03d}"} for i, g in enumerate(merged.values(), 1)}
         mains = [i for i, g in groups.items() if g["role"] == "main_referent"]
         mappings[sid] = {"nlp_groups": groups, "main_ids": mains}
@@ -505,7 +528,7 @@ def prepare(source, ids, args, prompt, output):
             frames_key = None
             for sid in sorted(sids):
                 row = source.row(sid)
-                inspection, reason = inspect_row(row, args.max_tracklets)
+                inspection, reason = inspect_row(row, args.max_tracklets, getattr(args, 'max_entity_tracks', MAX_ENTITY_TRACKS))
                 if reason:
                     early[sid] = {"sample_id": sid, "decision": "reject", "tagged_caption": "", "reason_codes": [reason], "stage": "heuristic"}
                     continue
@@ -516,7 +539,7 @@ def prepare(source, ids, args, prompt, output):
                 frames_key = frame_hash
                 kept, aliases = inspection
                 local_to_visual, visual_to_local = {}, {}
-                mains = main_ids(row)
+                mains = set() if row['negative'] else main_ids(row)
                 for track in kept:
                     signature = track_signature(row_frames, track)
                     if signature not in registry:
@@ -592,6 +615,9 @@ def prepare(source, ids, args, prompt, output):
                 packets.append(manifest)
             if number % 25 == 0 or number == len(by_video):
                 print(dumps({"event": "prepared", "videos": number, "total_videos": len(by_video), "requests": len(packets)}), flush=True)
+            # Full training runs must not accumulate decompressed row groups.
+            tracks, prepared, subset = {}, [], {}
+            release_memory()
     finally:
         media.close()
     atomic_json(output / "heuristics.json", early)
@@ -627,7 +653,7 @@ def response_schema(manifest):
         if manifest.get("stage") == "nlp":
             properties["decision"]["enum"] = ["keep", "rewrite"]
         properties["sample_id"]["enum"] = [expression["sample_id"]]
-        if expression["negative"]:
+        if expression["negative"] and not expression['allowed_ids']:
             properties["tagged_caption"]["enum"] = ["", expression["existing_text"]]
         else:
             alternatives = "|".join(str(tid) for tid in expression["allowed_ids"])
@@ -743,7 +769,11 @@ def save_response(manifest, response, source, output):
             try:
                 apply_result(source.row(sid), result, mapping)
             except (ValueError, KeyError, TypeError) as exc:
-                result = {"sample_id": sid, "decision": "error", "reason_codes": [str(exc)], "model_result": result}
+                if str(exc) == 'excessive_entity_link':
+                    result = {'sample_id': sid, 'decision': 'reject', 'tagged_caption': '',
+                              'reason_codes': ['excessive_entity_link']}
+                else:
+                    result = {"sample_id": sid, "decision": "error", "reason_codes": [str(exc)], "model_result": result}
         if result["decision"] == "error":
             invalid.append(sid)
         provenance = {k: manifest[k] for k in ("transport_retry_of", "validation_retry_of") if k in manifest}
