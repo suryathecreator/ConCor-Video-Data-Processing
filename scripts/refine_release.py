@@ -254,11 +254,14 @@ def main():
                 ready.append(sid)
             else:
                 early[sid] = {'sample_id': sid, **decision}
-        if nlp_counts['error'] or nlp_counts['pending']:
-            atomic_json(output / 'unresolved_nlp.json', early)
-            raise RuntimeError('NLP errors/pending results require recovery before visual processing')
+        # Failed NLP rows must not block unrelated, validated expressions. Keep
+        # their original status for the final audit and publication gate.
+        unresolved = {sid: decision for sid, decision in early.items()
+                      if decision['decision'] in {'error', 'pending'}}
+        atomic_json(output / 'unresolved_nlp.json', unresolved)
         cleaned = CleanedSource(source, nlp)
-        status('preparing_visual', nlp_counts=dict(nlp_counts))
+        status('preparing_visual', nlp_counts=dict(nlp_counts),
+               eligible_expressions=len(ready), unresolved_nlp=len(unresolved))
         if (output / 'requests.json').exists():
             packets, visual_early = load_packets(output), loads((output / 'heuristics.json').read_text())
         else:

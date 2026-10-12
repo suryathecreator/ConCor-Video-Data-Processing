@@ -250,6 +250,8 @@ not a promised final price or a measured semantic accuracy score.
 
 [`scripts/refine_release.py`](scripts/refine_release.py) processes **only the training Parquet**, through both NLP and visual passes. The separate sample wrapper remains capped at 200 videos. A completed review using the same prompts is required before any full-run API submission. The estimate weights measured review costs by dataset and candidate-density range, applies the Batch discount, adds two standard errors and a 50% margin, and takes no credit for sharing full-run visual requests. It is a reasonable estimate, not a quote; the durable ledger independently caps reservations and charges below $100, including all supplied prior ledgers.
 
+Only validated NLP results with **keep/rewrite** decisions proceed to visual refinement. Remaining NLP errors or pending results do not block valid expressions: they stay in unresolved_nlp.json and the final audit with their original status. Structural rejections stay excluded. The controller still requires all input outcomes to be resolved before automatic HF publication; forwarding valid rows does not relabel failures as semantic rejections.
+
 ~~~bash
 python scripts/refine_release.py \
   --input data/hf/train/verification.parquet --media-root /data/concor-video \
