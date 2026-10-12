@@ -1130,6 +1130,15 @@ def collect_batches(batches, packets, source, output, ledger, client, wait):
             if status["status"] not in {"completed", "failed", "expired", "cancelled"}:
                 pending += 1
                 continue
+            # A restart initially loads original packets only, but a submitted
+            # validation retry can already be complete. Recover its durable
+            # manifest before collecting that batch; never recreate the request.
+            for rid in batch["requests"]:
+                if rid not in by_id:
+                    manifest = loads((output / "packets" / rid / "input.json").read_text())
+                    if manifest.get("request_id") != rid:
+                        raise ValueError("saved request manifest ID disagrees with batch")
+                    by_id[rid] = manifest
             for field in ("output_file_id", "error_file_id"):
                 if not status.get(field):
                     continue

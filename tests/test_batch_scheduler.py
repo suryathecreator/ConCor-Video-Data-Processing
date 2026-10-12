@@ -204,3 +204,42 @@ def test_server_error_cannot_release_reservations_even_with_queue_text(setup):
         r.submit_batches(packets(3), 'prompt', path, ledger, api, collect)
     assert ledger.total() == 3.
     assert json.loads(next((path / 'submissions').glob('*.json')).read_text())['state'] == 'submitting'
+
+
+def test_resume_collects_saved_retry_without_resubmission(setup):
+    path, ledger, api, packets, _ = setup
+    original = packets(1)[0]
+    retry = {"request_id": "retry0", "validation_retry_of": "r0", "mapping": {}}
+    r.atomic_json(path / "packets/retry0/input.json", retry)
+    ledger.reserve("r0", 1.)
+    ledger.settle("r0", .1)
+    ledger.reserve("retry0", 1.)
+    batch = {"id": "old-retry", "requests": ["retry0"]}
+    api.batches["old-retry"] = {"id": "old-retry", "ids": ["retry0"],
+                                "request_counts": {"total": 1, "completed": 1}}
+    api.complete("old-retry")
+
+    # The release wrapper initially provides originals only on restart.
+    states = r.collect_batches([batch], [original], None, path, ledger, api, False)
+    assert states["old-retry"]["status"] == "completed"
+    assert (path / "packets/retry0/response.json").exists()
+    assert (path / "batch-receipts/old-retry.json").exists()
+    assert ledger.db.execute("select id,amount,state from charges order by id").fetchall() == [
+        ("r0", .1, "completed"), ("retry0", .1, "completed")]
+    r.collect_batches([batch], [original], None, path, ledger, api, False)
+    assert ledger.total() == pytest.approx(.2)
+    assert not api.posts  # Retrieval cannot create another paid request.
+
+
+def test_resume_rejects_mismatched_saved_retry_manifest(setup):
+    path, ledger, api, packets, _ = setup
+    r.atomic_json(path / "packets/retry0/input.json", {"request_id": "unrelated", "mapping": {}})
+    ledger.reserve("retry0", 1.)
+    batch = {"id": "old-retry", "requests": ["retry0"]}
+    api.batches["old-retry"] = {"id": "old-retry", "ids": ["retry0"]}
+    api.complete("old-retry")
+    with pytest.raises(ValueError, match="manifest ID disagrees"):
+        r.collect_batches([batch], packets(1), None, path, ledger, api, False)
+    assert ledger.total() == 1.
+    assert not (path / "batch-receipts/old-retry.json").exists()
+    assert not api.posts
