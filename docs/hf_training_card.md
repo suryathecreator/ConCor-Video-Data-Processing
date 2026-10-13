@@ -61,6 +61,19 @@ Tracklets count full instance-mask sequences **per expression**, not unique obje
 
 GPT files also expose native `frame_ids`, `caption_links` (start/end/text/object IDs), `object_count`, `linked_phrase_count`, and `refinement_decision`. JSON-suffixed strings use `json.loads`; offsets are zero-based Unicode positions with exclusive end. `complete_bcc` means representation checks passed, not human semantic verification. Source video frames are not bundled; obtain media under the upstream datasets' terms.
 
+## Batch throughput and future optimization
+
+Observed on **October 11–12, 2026**, using GPT-6 Luna with medium reasoning; counts include validation retries:
+
+| Stage | API requests | Batches | First submission → last API completion | Average requests/min |
+| --- | ---: | ---: | --- | ---: |
+| Text-only NLP cleanup | 4,596 | 4 | 13 h 43 min | 5.6 |
+| Visual refinement | 6,360 | 99 | 5 h 3 min | 21.0 |
+
+These wall-clock averages include queueing, staggered submissions, and retries; the NLP window also includes the earlier conservative scheduler and collection/resume delays. They are observations, not model-speed guarantees. A visual request can cover multiple captions. Individual visual batches took a median **53 minutes**; all 103 batches completed with **zero API request failures or expirations**. Local validation errors remain separate, as described above.
+
+**Future optimization:** the current wrapper already converts frame/overlay JPEGs to **base64 data URLs** and embeds them in each JSON request within the Batch JSONL file. Base64 does not avoid the size limit. Instead, host those same JPEGs and put their **HTTPS image URLs** in the request JSON. Removing embedded image bytes may keep larger batches below the **200 MB input-file limit**, reducing the many size-driven splits. URLs must remain fetchable throughout processing and retries; the 50,000-request and account queue limits still apply. Fewer files do not guarantee faster inference or lower image-token costs. See the [official OpenAI Batch guidance](https://developers.openai.com/api/docs/guides/batch).
+
 ## Cost and remaining improvements
 
 The density-stratified 200-video pilot (100 per dataset) estimated **USD ${expected_cost}** for full Batch processing; the conservative estimate including prior work was **USD ${buffered_cost}**, under the **USD 99 aggregate cap**. Recorded completed charges were **USD ${run_cost} for this run**, **USD ${completed_usd} including pilots**; the ledger accounts for **USD ${accounted_usd} including an older USD ${reserved_usd} reservation**. These are recorded usage costs, not a guaranteed future quote.
