@@ -275,6 +275,37 @@ The original $5 pilot / $95 full-run split was a planning allowance. Include **a
 
 Pricing checked 2026-10-11: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) costs $0.10 input / $0.50 output per million standard tokens ($0.125 cache writes; $0.01 cache hits); [Batch](https://developers.openai.com/api/docs/guides/batch) halves those rates and has a 24-hour completion window. The ledger includes reasoning output, reserves the output ceiling, assumes no cache hits, accounts for cache writes and long-context premiums, and settles from returned usage. Image billing estimates deliberately overestimate patch tokens. Input rendering time and your account's Batch queue limit also affect ETA; multiple queue waves can take longer than 24 hours. Shared evidence reduces cost without lowering the requested model or visual resolution.
 
+
+### Publish the training variants
+
+The current HF release exposes **`gpt_refined` → `train_filtered`** (only
+`disposition == "complete_bcc"`) and **`train_all`** (all validated GPT keep/rewrite
+rows, including intentional negatives). Both retain `disposition` and expose the
+readable columns described above. The original 22-column training export and its
+manifest move byte-for-byte from `train/` to `train_old/`, available as
+**`original` → `train_old`**. Evaluation files remain unchanged.
+
+[`scripts/publish_training_variants.py`](scripts/publish_training_variants.py)
+prepares two single Parquets and the [HF card](docs/hf_training_card.md), then
+publishes those files and the archive rename in one commit. It verifies source and
+uploaded checksums, exact retained sample IDs, complete-BCC filtering, and unchanged
+evaluation files. It uploads neither credentials nor local run/checkpoint folders.
+
+```bash
+export HF_HOME="$PWD/outputs/luna-training-v2-20261011/hf-cache"
+.venv/bin/python scripts/publish_training_variants.py \
+  --run outputs/luna-training-v2-20261011 --exclude-unresolved-errors
+.venv/bin/python scripts/publish_training_variants.py \
+  --run outputs/luna-training-v2-20261011 --publish
+```
+
+The explicit `--exclude-unresolved-errors` option supports the requested release of
+validated results: 111 unresolved annotations remain errors in the local audit and
+are disclosed as exclusions in the card. Pending work always blocks publication;
+errors are never relabeled as semantic rejections. The standard automatic release
+publisher retains its complete-run requirement. No inference is rerun by this export.
+
+
 Batch packing uses the [documented API limits](https://developers.openai.com/api/docs/guides/batch): **50,000 requests and 200 MB per file**, measured after JSON/base64 serialization. There is no additional 1,000-request cap, 180 MB margin, guessed 16-million-token queue cap, or one-active-batch restriction. The API's actual account/model queue allowance controls admission. Project keys may not have access to admin rate-limit endpoints (the current key receives HTTP 403), so the scheduler uses real admission/rejection responses rather than assuming an account tier. It records any token limit reported by the service in `queue-capacity.json`. Only an explicit queue rejection before inference triggers smaller submissions; available capacity is retried automatically and completed batches free capacity. The 24-hour window starts separately for each submitted batch; the visual pass depends on completed NLP cleanup.
 
 The **aggregate $99 ledger cap remains independent of batch size and concurrency**. Completed charges plus all outstanding maximum-cost reservations must fit before submission. If reservations temporarily occupy the budget, the scheduler collects results and uses the released capacity. Packing the same model requests into larger files does not add paid requests or change their prompts, grouping, images, or model. Submission journals are saved before paid POSTs, carry unique metadata tickets, and recover accepted batches after a lost response. A submission whose acceptance remains uncertain keeps its reservation and is never blindly repeated. Explicit pre-inference queue rejections are recorded separately from annotation errors and semantic rejections.
